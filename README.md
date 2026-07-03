@@ -5,14 +5,9 @@
 ### Your onchain pet world on Solana
 
 Raise a pet, keep it happy, master the minigames, and earn.
-**Petaverse** is a skill‑to‑earn pet universe — part Tamagotchi, part monster‑collector, all onchain.
+**Petaverse** is a skill‑to‑earn *and* idle‑farm pet universe — part Tamagotchi, part monster‑collector, all onchain.
 
-![Solana](https://img.shields.io/badge/Built%20on-Solana-14F195?style=flat-square)
-![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square)
-![Vite](https://img.shields.io/badge/Vite-8-646CFF?style=flat-square)
-![Status](https://img.shields.io/badge/status-early%20demo-orange?style=flat-square)
-
-[Play the demo](#-getting-started) · [How it works](#-how-the-universe-works) · [How to earn](#-how-to-earn) · [Roadmap](#-roadmap)
+[Play now](#-getting-started) · [How it works](#-how-the-universe-works) · [How to earn](#-how-to-earn) · [Roadmap](#-roadmap)
 
 </div>
 
@@ -27,8 +22,9 @@ You **feed it, play with it, and keep its stats up** — neglect it and it gets 
 skill in **two minigames**. Everything runs on the **Solana** economy: the in‑game currency is
 **PV** (its token is **$PV**), and the marketplace runs on **SOL**.
 
-> 💡 **The idea:** most pet games are *idle* play‑to‑earn. Petaverse is **skill‑to‑earn** — the better
-> you play, the more you earn.
+> 💡 **The idea:** earn **two ways** — by **skill** (win the minigames) *and* by **farming over time**
+> (your pet keeps earning PV passively while you care for it). The better you play *and* the more you
+> tend your pet, the more you earn.
 
 ---
 
