@@ -11,6 +11,8 @@ import { type Stats, clamp, xpForLevel, decay, decayMult, silRate, statCap, DAIL
 import { POTIONS, potionById, potionEffects, potionTitle, type Potion } from "./game/potions";
 import { QUESTS } from "./game/quests";
 import { type SavedPet, STORAGE_KEY, loadPet, type MarketListing } from "./game/save";
+import { getPhantom, shortAddress, signMessageHex, PHANTOM_INSTALL_URL } from "./game/wallet";
+import { isCloudEnabled, loadCloudSave, saveCloudSave, submitScore, fetchTopScores, submitArena, fetchTopArena, upsertPvpProfile, findPvpOpponent, fetchListings, createListing, deleteListing, signIn, setSessionToken, type ScoreRow, type ArenaRow, type Listing } from "./game/cloud";
 import { SPIN_MS, playSpinSound, playWinSound } from "./game/audio";
 import { Coin, StatBar } from "./components/ui";
 import { PetArt } from "./components/PetArt";
@@ -63,6 +65,12 @@ const SOL_BUY_PACKS = [0.1, 0.5, 1, 2];
 // Варианты продажи Sil (получаем SOL).
 const SIL_SELL_PACKS = [5000, 25000, 62500, 125000];
 
+// Сессия верификации кошелька (JWT из auth-функции), хранится локально для бесшовного входа.
+const SESSION_KEY = "petaverse.session";
+function jwtExpMs(token: string): number {
+  try { return (JSON.parse(atob(token.split(".")[1])).exp ?? 0) * 1000; } catch { return 0; }
+}
+
 // Воскрешение: цена лекарства = база + за каждый уровень питомца.
 const REVIVE_BASE = 50;
 const REVIVE_PER_LEVEL = 100;
@@ -86,6 +94,15 @@ export default function App() {
   const [petMenu, setPetMenu] = useState(false); // панель взаимодействия с питомцем
   const [showBuffs, setShowBuffs] = useState(false); // раскрыта ли панель баффов (когда их >2)
   const [questsOpen, setQuestsOpen] = useState(true); // раскрыт ли список квестов
+  const [wallet, setWallet] = useState<string | null>(null); // адрес подключённого кошелька Phantom (= ID игрока)
+  const [walletMenu, setWalletMenu] = useState(false); // открыт ли попап кошелька
+  const [cloudLoading, setCloudLoading] = useState(false); // идёт ли загрузка облачного сейва
+  const [verified, setVerified] = useState(false); // подтверждён ли кошелёк подписью
+  const [topScores, setTopScores] = useState<ScoreRow[] | null>(null); // глобальный топ лидерборда
+  const [lbLoaded, setLbLoaded] = useState(false); // загрузили ли топ (чтобы отличить загрузку от «пусто»)
+  const [arenaTop, setArenaTop] = useState<ArenaRow[] | null>(null); // глобальный топ арены
+  const [marketListings, setMarketListings] = useState<Listing[] | null>(null); // общие лоты рынка
+  const [marketLoaded, setMarketLoaded] = useState(false); // загрузили ли лоты
   const [marketTab, setMarketTab] = useState<"exclusive" | "player" | "auction">("exclusive");
   const [listSpecies, setListSpecies] = useState<string>(""); // выбранный питомец для листинга
   const [listPrice, setListPrice] = useState<string>(""); // цена/старт-ставка (SOL) для листинга
@@ -146,6 +163,114 @@ export default function App() {
     const t = setTimeout(() => setToast(""), 2200);
     return () => clearTimeout(t);
   }, [toast]);
+
+  // Кошелёк Phantom: тихое авто-переподключение (если уже разрешён) + слежение за сменой аккаунта.
+  useEffect(() => {
+    const provider = getPhantom();
+    if (!provider) return;
+    provider.connect({ onlyIfTrusted: true })
+      .then((res) => setWallet(res.publicKey.toString()))
+      .catch(() => {}); // не разрешён — просто ждём ручного нажатия Connect
+    const onConnect = () => provider.publicKey && setWallet(provider.publicKey.toString());
+    const onDisconnect = () => setWallet(null);
+    const onAccountChanged = (pk: unknown) => setWallet(pk ? String((pk as { toString(): string }).toString()) : null);
+    provider.on("connect", onConnect);
+    provider.on("disconnect", onDisconnect);
+    provider.on("accountChanged", onAccountChanged);
+    return () => {
+      provider.removeAllListeners("connect");
+      provider.removeAllListeners("disconnect");
+      provider.removeAllListeners("accountChanged");
+    };
+  }, []);
+
+  // Сессия верификации: при смене кошелька восстанавливаем сохранённый токен (если валиден).
+  useEffect(() => {
+    if (!wallet) { setSessionToken(null); setVerified(false); return; }
+    try {
+      const raw = localStorage.getItem(SESSION_KEY);
+      if (raw) {
+        const s = JSON.parse(raw) as { wallet: string; token: string };
+        if (s.wallet === wallet && jwtExpMs(s.token) > Date.now()) {
+          setSessionToken(s.token);
+          setVerified(true);
+          return;
+        }
+      }
+    } catch { /* игнорируем */ }
+    setSessionToken(null);
+    setVerified(false);
+  }, [wallet]);
+
+  // Облако: при подключении кошелька грузим его сейв. Если у кошелька его ещё нет —
+  // заливаем текущего локального питомца (чтобы прогресс не потерялся).
+  useEffect(() => {
+    if (!wallet || !isCloudEnabled()) return;
+    let cancelled = false;
+    setCloudLoading(true);
+    loadCloudSave(wallet)
+      .then((cloud) => {
+        if (cancelled) return;
+        if (cloud) setPet(cloud); // облачный питомец этого кошелька — источник правды
+        else if (petRef.current) saveCloudSave(wallet, petRef.current); // у кошелька сейва нет → заливаем локального
+        const p = cloud ?? petRef.current;
+        if (p && p.bestScore > 0) submitScore(wallet, p.name, p.bestScore); // засветиться в лидерборде
+        if (p && p.battleWins + p.battleLosses > 0)
+          submitArena({ wallet, name: p.name, species: p.species, power: loadoutPower(p.level, p.accessories, 0).power, wins: p.battleWins, losses: p.battleLosses });
+        if (p) upsertPvpProfile({ wallet, name: p.name, species: p.species, level: p.level, accessories: p.accessories }); // профиль для PvP
+      })
+      .finally(() => { if (!cancelled) setCloudLoading(false); });
+    return () => { cancelled = true; };
+  }, [wallet]);
+
+  // Лидерборд: подгружаем глобальный топ при открытии модалки Ranks.
+  useEffect(() => {
+    if (modal !== "leaderboard" || !isCloudEnabled()) return;
+    let cancelled = false;
+    setLbLoaded(false);
+    fetchTopScores(20).then((rows) => {
+      if (cancelled) return;
+      setTopScores(rows);
+      setLbLoaded(true);
+    });
+    return () => { cancelled = true; };
+  }, [modal]);
+
+  // Арена: подгружаем глобальный рейтинг при открытии Battle Arena.
+  useEffect(() => {
+    if (modal !== "battle" || !isCloudEnabled()) return;
+    let cancelled = false;
+    setArenaTop(null);
+    fetchTopArena(20).then((rows) => { if (!cancelled) setArenaTop(rows); });
+    return () => { cancelled = true; };
+  }, [modal]);
+
+  // Рынок: подгружаем общие лоты при открытии рынка и смене вкладки (продажа/аукцион).
+  useEffect(() => {
+    if (modal !== "market" || !isCloudEnabled()) return;
+    if (marketTab !== "player" && marketTab !== "auction") return;
+    let cancelled = false;
+    setMarketLoaded(false);
+    const kind = marketTab === "player" ? "sale" : "auction";
+    fetchListings(kind).then((rows) => {
+      if (cancelled) return;
+      setMarketListings(rows);
+      setMarketLoaded(true);
+    });
+    return () => { cancelled = true; };
+  }, [modal, marketTab]);
+
+  // Облако: периодически сохраняем прогресс + обновляем боевой профиль для PvP (раз в 20с).
+  useEffect(() => {
+    if (!wallet || !isCloudEnabled()) return;
+    const iv = setInterval(() => {
+      const p = petRef.current;
+      if (!p) return;
+      saveCloudSave(wallet, p);
+      upsertPvpProfile({ wallet, name: p.name, species: p.species, level: p.level, accessories: p.accessories });
+    }, 20000);
+    return () => clearInterval(iv);
+  }, [wallet]);
 
   function createPet() {
     if (!picked || !name.trim()) return;
@@ -384,6 +509,64 @@ export default function App() {
     setPet((prev) => (prev ? { ...prev, coins: Math.max(0, prev.coins + delta), updatedAt: Date.now() } : prev));
   }
 
+  // Подключить кошелёк Phantom (по кнопке). Нет расширения → отправляем на установку.
+  async function connectWallet() {
+    const provider = getPhantom();
+    if (!provider) {
+      window.open(PHANTOM_INSTALL_URL, "_blank", "noopener");
+      return setToast("Install Phantom to connect");
+    }
+    try {
+      const res = await provider.connect();
+      const addr = res.publicKey.toString();
+      setWallet(addr);
+      setToast("👛 Wallet connected");
+      // Авто-верификация при первом подключении (если нет валидного сохранённого токена).
+      let hasValid = false;
+      try {
+        const raw = localStorage.getItem(SESSION_KEY);
+        const s = raw ? (JSON.parse(raw) as { wallet: string; token: string }) : null;
+        hasValid = !!(s && s.wallet === addr && jwtExpMs(s.token) > Date.now());
+      } catch { /* нет токена */ }
+      if (!hasValid && isCloudEnabled()) verifyWallet(addr);
+    } catch {
+      setToast("Connection cancelled");
+    }
+  }
+  async function disconnectWallet() {
+    if (wallet && petRef.current) await saveCloudSave(wallet, petRef.current); // сохраняем последнее состояние
+    try {
+      await getPhantom()?.disconnect();
+    } catch {
+      /* игнорируем */
+    }
+    setWallet(null);
+    setWalletMenu(false);
+    setToast("Wallet disconnected");
+  }
+
+  // Верификация: подписываем сообщение кошельком → получаем токен (доказывает, что адрес твой).
+  async function verifyWallet(addr?: string) {
+    const provider = getPhantom();
+    const w = addr ?? wallet;
+    if (!provider || !w) return;
+    const message = `Sign in to Petaverse\nwallet: ${w}\nts:${Date.now()}`;
+    try {
+      const sigHex = await signMessageHex(provider, message);
+      const token = await signIn(w, message, sigHex);
+      if (token) {
+        setVerified(true);
+        setWalletMenu(false);
+        localStorage.setItem(SESSION_KEY, JSON.stringify({ wallet: w, token }));
+        setToast("✅ Wallet verified");
+      } else {
+        setToast("Verification failed — is the auth function deployed?");
+      }
+    } catch {
+      setToast("Signature cancelled");
+    }
+  }
+
   // Обмен SOL → Sil (покупка Sil): тратим SOL, получаем SOL_BUY_RATE Sil за каждый SOL.
   function buySilWithSol(solAmount: number) {
     setPet((prev) => {
@@ -436,6 +619,7 @@ export default function App() {
       lootLabel = FOODS.find((f) => f.id === id)?.label ?? "food";
     }
     setPet({ ...pet, coins: pet.coins + silReward + stake, xp, level, battleWins: pet.battleWins + 1, inventory, ownedAccessories, updatedAt: now });
+    if (wallet) submitArena({ wallet, name: pet.name, species: pet.species, power: loadoutPower(pet.level, pet.accessories, 0).power, wins: pet.battleWins + 1, losses: pet.battleLosses });
     setToast(`🏆 Victory! +${silReward}${stake ? `+${stake} bet` : ""} ${SIL}, +60 XP, looted ${lootLabel}`);
   }
 
@@ -446,6 +630,7 @@ export default function App() {
     const stake = Math.min(Math.max(0, bet), pet.coins);
     const health = Math.max(0, pet.stats.health - 10);
     setPet({ ...pet, stats: { ...pet.stats, health }, coins: pet.coins - stake, battleLosses: pet.battleLosses + 1, updatedAt: now });
+    if (wallet) submitArena({ wallet, name: pet.name, species: pet.species, power: loadoutPower(pet.level, pet.accessories, 0).power, wins: pet.battleWins, losses: pet.battleLosses + 1 });
     setToast(`💔 Defeat! ${pet.name} took 10 damage${stake ? ` and lost ${stake} ${SIL}` : ""}`);
   }
 
@@ -584,7 +769,7 @@ export default function App() {
   }
 
   // Выставить своего питомца на рынок игроков (продажа или аукцион) с текущим уровнем и баффами.
-  function listPet(kind: "sale" | "auction") {
+  async function listPet(kind: "sale" | "auction") {
     if (!pet) return;
     const species = listSpecies;
     const askPrice = parseFloat(listPrice);
@@ -592,16 +777,29 @@ export default function App() {
     if (!(askPrice > 0)) return setToast("Enter a valid SOL price");
     const lvl = species === pet.species ? pet.level : pet.progress[species]?.level ?? 1;
     const buffs = species === pet.species ? pet.buffs : pet.progress[species]?.buffs ?? [];
-    const listing: MarketListing = { id: `l${Date.now()}`, kind, species, level: lvl, buffs, price: askPrice, createdAt: Date.now() };
-    setPet({ ...pet, listings: [...pet.listings, listing] });
+    const id = `l${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
     setListSpecies("");
     setListPrice("");
+    if (wallet && isCloudEnabled()) {
+      // Общий лот в Supabase — виден всем игрокам.
+      const name = species === pet.species ? pet.name : pet.names[species] ?? "";
+      await createListing({ id, seller: wallet, kind, species, level: lvl, buffs, price: askPrice, name });
+      fetchListings(kind).then(setMarketListings);
+    } else {
+      // Локальный лот (без облака) — виден только тебе.
+      setPet({ ...pet, listings: [...pet.listings, { id, kind, species, level: lvl, buffs, price: askPrice, createdAt: Date.now() } as MarketListing] });
+    }
     setToast(kind === "sale" ? "🏷️ Pet listed for sale" : "🔨 Pet listed for auction");
   }
   // Снять свой лот с рынка.
-  function cancelListing(id: string) {
+  async function cancelListing(id: string, kind: "sale" | "auction") {
     if (!pet) return;
-    setPet({ ...pet, listings: pet.listings.filter((l) => l.id !== id) });
+    if (wallet && isCloudEnabled()) {
+      await deleteListing(id, wallet);
+      fetchListings(kind).then(setMarketListings);
+    } else {
+      setPet({ ...pet, listings: pet.listings.filter((l) => l.id !== id) });
+    }
   }
 
   const pickedInfo = PETS.find((p) => p.id === picked);
@@ -692,9 +890,36 @@ export default function App() {
           <span className="tagline">your onchain pet world</span>
         </div>
         <div className="topbar-right">
+          <div className="wallet-wrap">
+            {wallet ? (
+              <button className="wallet-btn wallet-on" onClick={() => setWalletMenu((v) => !v)} title={verified ? "Verified" : "Connected (not verified)"}>
+                <span className={"wallet-dot" + (verified ? "" : " wallet-dot-unverified")} /> {shortAddress(wallet)}
+              </button>
+            ) : (
+              <button className="wallet-btn" onClick={connectWallet}>Connect wallet</button>
+            )}
+            {wallet && walletMenu && (
+              <>
+                <div className="wallet-scrim" onClick={() => setWalletMenu(false)} />
+                <div className="wallet-menu">
+                  <div className="wallet-addr" title={wallet}>{shortAddress(wallet)}</div>
+                  {verified ? (
+                    <div className="wallet-verified">✓ Verified</div>
+                  ) : (
+                    <button className="wallet-menu-btn" onClick={() => verifyWallet()}>🔏 Verify wallet</button>
+                  )}
+                  <button className="wallet-menu-btn" onClick={() => { navigator.clipboard?.writeText(wallet); setToast("Address copied"); setWalletMenu(false); }}>Copy address</button>
+                  <button className="wallet-menu-btn wallet-disc" onClick={disconnectWallet}>Disconnect</button>
+                </div>
+              </>
+            )}
+          </div>
           {pet && (
-            <span className="coins" title={`+${+silPerMin.toFixed(2)} ${SIL}/min passive`}>
-              <Coin /> {Math.floor(pet.coins)} {SIL} <span className="rate">+{+silPerMin.toFixed(2)}/min</span>
+            <span className="balance-pill" title={`+${+silPerMin.toFixed(2)} ${SIL}/min passive`}>
+              <Coin />
+              <span className="balance-amt">{Math.floor(pet.coins).toLocaleString()}</span>
+              <span className="balance-cur">{SIL}</span>
+              <span className="rate">+{+silPerMin.toFixed(2)}/min</span>
             </span>
           )}
           {pet && (
@@ -706,7 +931,13 @@ export default function App() {
         </div>
       </header>
 
-      {!pet ? (
+      {cloudLoading && !pet ? (
+        // ===== Cloud sync loading =====
+        <main className="stage">
+          <h1 className="title">Syncing…</h1>
+          <p className="subtitle">Loading your pet from the cloud ☁️</p>
+        </main>
+      ) : !pet ? (
         // ===== Create screen =====
         <main className="stage">
           <h1 className="title">Choose your pet</h1>
@@ -1109,19 +1340,39 @@ export default function App() {
 
       {/* ===== Leaderboard ===== */}
       {modal === "leaderboard" && pet && (() => {
-        const rows = [
-          ...LEADERBOARD_BOTS.map((b) => ({ ...b, you: false })),
-          { name: `${pet.name} (you)`, score: pet.bestScore, you: true },
-        ].sort((a, b) => b.score - a.score);
-        const myRank = rows.findIndex((r) => r.you) + 1;
-        const reward = runRewardForRank(myRank);
+        const cloud = isCloudEnabled();
+        const loading = cloud && !lbLoaded;
+        const realMode = cloud && lbLoaded && topScores !== null; // есть живой топ из Supabase
+        // Строки для показа + ранг игрока (0 = вне топа / нет счёта).
+        let rows: { key: string; name: string; score: number; you: boolean }[];
+        let myRank: number;
+        if (realMode) {
+          rows = topScores!.map((r) => ({
+            key: r.wallet,
+            name: (r.name && r.name.trim()) || shortAddress(r.wallet),
+            score: r.score,
+            you: !!wallet && r.wallet === wallet,
+          }));
+          const idx = wallet ? topScores!.findIndex((r) => r.wallet === wallet) : -1;
+          myRank = idx >= 0 ? idx + 1 : 0;
+        } else {
+          rows = [
+            ...LEADERBOARD_BOTS.map((b) => ({ key: b.name, name: b.name, score: b.score, you: false })),
+            { key: "you", name: pet.name, score: pet.bestScore, you: true },
+          ].sort((a, b) => b.score - a.score);
+          myRank = rows.findIndex((r) => r.you) + 1;
+        }
+        const inTop = myRank > 0;
+        const reward = inTop ? runRewardForRank(myRank) : pet.bestScore > 0 ? 50 : 0;
         const left = pet.lastRunReward + RUN_REWARD_COOLDOWN - Date.now();
-        const rewardReady = pet.bestScore > 0 && left <= 0;
+        const canReward = realMode ? !!wallet && pet.bestScore > 0 : pet.bestScore > 0;
+        const rewardReady = canReward && left <= 0;
+        const showMyRow = realMode && !!wallet && pet.bestScore > 0 && !inTop; // в игре, но не в топ-20
         function claimRunReward() {
           if (!rewardReady) return;
           addCoins(reward);
           setPet((p) => (p ? { ...p, lastRunReward: Date.now(), updatedAt: Date.now() } : p));
-          setToast(`🏆 Run reward (rank #${myRank}): +${reward} ${SIL}`);
+          setToast(`🏆 Run reward${inTop ? ` (rank #${myRank})` : ""}: +${reward} ${SIL}`);
         }
         const hh = Math.max(0, Math.floor(left / 3_600_000));
         const mm = Math.max(0, Math.floor((left % 3_600_000) / 60_000));
@@ -1129,23 +1380,45 @@ export default function App() {
           <div className="scrim" onClick={() => setModal(null)}>
             <div className="modal" onClick={(e) => e.stopPropagation()}>
               <div className="modal-head">
-                <h3>🏆 Top runs</h3>
+                <h3>🏆 {realMode ? "Global top runs" : "Top runs"}</h3>
               </div>
-              <p className="subtitle" style={{ marginTop: -4 }}>Best Play scores. Top runs earn PV every hour.</p>
-              <div className="lb-list">
-                {rows.map((r, i) => (
-                  <div key={r.name} className={"lb-row" + (r.you ? " lb-you" : "")}>
-                    <span className="lb-rank">{i + 1}</span>
-                    <span className="lb-name">{r.name}</span>
-                    <span className="lb-sil">♪ {r.score.toLocaleString()}</span>
-                  </div>
-                ))}
-              </div>
+              <p className="subtitle" style={{ marginTop: -4 }}>
+                {realMode ? "Best rhythm scores across all players. Top runs earn PV every hour." : "Best Play scores. Top runs earn PV every hour."}
+              </p>
+              {loading ? (
+                <p className="empty">Loading the leaderboard… ⏳</p>
+              ) : (
+                <div className="lb-list">
+                  {rows.length === 0 ? (
+                    <p className="empty">No scores yet — be the first! 🎵</p>
+                  ) : (
+                    rows.map((r, i) => (
+                      <div key={r.key} className={"lb-row" + (r.you ? " lb-you" : "")}>
+                        <span className="lb-rank">{i + 1}</span>
+                        <span className="lb-name">{r.name}{r.you ? " (you)" : ""}</span>
+                        <span className="lb-sil">♪ {r.score.toLocaleString()}</span>
+                      </div>
+                    ))
+                  )}
+                  {showMyRow && (
+                    <div className="lb-row lb-you">
+                      <span className="lb-rank">—</span>
+                      <span className="lb-name">{pet.name} (you)</span>
+                      <span className="lb-sil">♪ {pet.bestScore.toLocaleString()}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+              {realMode && !wallet && (
+                <p className="empty">🔌 Connect your wallet to join the global leaderboard and earn PV.</p>
+              )}
               <button className="btn btn-daily" disabled={!rewardReady} onClick={claimRunReward}>
-                {pet.bestScore === 0
-                  ? "🏆 Play a run to earn rewards"
+                {!canReward
+                  ? realMode && !wallet
+                    ? "🔌 Connect wallet to earn"
+                    : "🏆 Play a run to earn rewards"
                   : rewardReady
-                  ? `🏆 Claim rank #${myRank} reward +${reward} ${SIL}`
+                  ? `🏆 Claim ${inTop ? `rank #${myRank} ` : ""}reward +${reward} ${SIL}`
                   : `🏆 Next reward in ${hh}h ${mm}m`}
               </button>
               <button className="btn btn-ghost" onClick={() => setModal(null)}>Close</button>
@@ -1168,6 +1441,7 @@ export default function App() {
           onClose={() => setModal(null)}
           onFinish={(score, happy, durationMs) => {
             const cost = playFullnessCost(durationMs);
+            const prevBest = petRef.current?.bestScore ?? 0;
             setPet((p) =>
               p
                 ? {
@@ -1179,6 +1453,8 @@ export default function App() {
                   }
                 : p,
             );
+            // Новый личный рекорд → отправляем в глобальный лидерборд (если кошелёк подключён).
+            if (wallet && score > prevBest && petRef.current) submitScore(wallet, petRef.current.name, score);
             setToast(`🎵 Score ${score} · +${happy} happy · −${cost} fullness`);
           }}
         />
@@ -1208,7 +1484,13 @@ export default function App() {
 
             {(marketTab === "player" || marketTab === "auction") && (() => {
               const kind: "sale" | "auction" = marketTab === "player" ? "sale" : "auction";
-              const mine = pet.listings.filter((l) => l.kind === kind);
+              const cloud = isCloudEnabled();
+              const loading = cloud && !marketLoaded;
+              type Row = { id: string; species: string; level: number; price: number; buffs: { kind: BuffKind; expiresAt: number }[]; seller: string; mine: boolean };
+              // Общие лоты из Supabase (видны всем) или локальные (без облака — только свои).
+              const listings: Row[] = cloud
+                ? (marketListings ?? []).map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs ?? [], seller: l.seller, mine: !!wallet && l.seller === wallet }))
+                : pet.listings.filter((l) => l.kind === kind).map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs, seller: "you", mine: true }));
               return (
                 <>
                   <div className="section-label">{kind === "sale" ? "Sell a pet" : "Auction a pet"}</div>
@@ -1217,47 +1499,55 @@ export default function App() {
                       ? "List one of your pets for a fixed SOL price — it keeps its level & active buffs."
                       : "Put a pet up for auction with your own starting bid (in SOL)."}
                   </p>
-                  <div className="list-controls">
-                    <select className="name-input list-select" value={listSpecies} onChange={(e) => setListSpecies(e.target.value)}>
-                      <option value="">Choose a pet…</option>
-                      {pet.ownedSpecies.map((id) => {
-                        const info = PETS.find((p) => p.id === id)!;
-                        const lvl = id === pet.species ? pet.level : pet.progress[id]?.level ?? 1;
-                        return <option key={id} value={id}>{info.label} · Lv {lvl}</option>;
-                      })}
-                    </select>
-                    <input
-                      className="name-input list-price"
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      placeholder={kind === "sale" ? "Price ◎" : "Start ◎"}
-                      value={listPrice}
-                      onChange={(e) => setListPrice(e.target.value)}
-                    />
-                    <button className="btn btn-primary" onClick={() => listPet(kind)}>{kind === "sale" ? "🏷️ List" : "🔨 Start"}</button>
-                  </div>
+                  {cloud && !wallet ? (
+                    <p className="empty">🔌 Connect your wallet to list a pet on the market.</p>
+                  ) : (
+                    <div className="list-controls">
+                      <select className="name-input list-select" value={listSpecies} onChange={(e) => setListSpecies(e.target.value)}>
+                        <option value="">Choose a pet…</option>
+                        {pet.ownedSpecies.map((id) => {
+                          const info = PETS.find((p) => p.id === id)!;
+                          const lvl = id === pet.species ? pet.level : pet.progress[id]?.level ?? 1;
+                          return <option key={id} value={id}>{info.label} · Lv {lvl}</option>;
+                        })}
+                      </select>
+                      <input
+                        className="name-input list-price"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        placeholder={kind === "sale" ? "Price ◎" : "Start ◎"}
+                        value={listPrice}
+                        onChange={(e) => setListPrice(e.target.value)}
+                      />
+                      <button className="btn btn-primary" onClick={() => listPet(kind)}>{kind === "sale" ? "🏷️ List" : "🔨 Start"}</button>
+                    </div>
+                  )}
 
-                  {mine.length === 0 ? (
-                    <p className="empty">No {kind === "sale" ? "listings" : "auctions"} yet — {kind === "sale" ? "list a pet above" : "start an auction above"}. Other players buying/bidding needs the backend (coming soon).</p>
+                  {loading ? (
+                    <p className="empty">Loading the market… ⏳</p>
+                  ) : listings.length === 0 ? (
+                    <p className="empty">No {kind === "sale" ? "listings" : "auctions"} yet — be the first to list a pet!</p>
                   ) : (
                     <div className="inv-grid">
-                      {mine.map((l) => {
+                      {listings.map((l) => {
                         const info = PETS.find((p) => p.id === l.species)!;
                         const activeBuffs = l.buffs.filter((b) => b.expiresAt > Date.now()).length;
                         return (
                           <div key={l.id} className="inv-item inv-item-tall market-listing">
-                            <button className="mini-x" onClick={() => cancelListing(l.id)} title="Cancel listing">✕</button>
+                            {l.mine && <button className="mini-x" onClick={() => cancelListing(l.id, kind)} title="Cancel listing">✕</button>}
                             <span className="rar-dot" style={{ background: RARITY[info.rarity].color }} />
                             <span className="inv-emoji"><PetArt species={l.species} size={34} /></span>
                             <span className="inv-name">{info.label}</span>
                             <span className="inv-perk">Lv {l.level}{activeBuffs ? ` · ✨${activeBuffs}` : ""}</span>
                             <span className="inv-feed">{kind === "sale" ? "◎ " : "start ◎ "}{l.price}</span>
+                            <span className="market-seller">{l.mine ? "your listing" : cloud ? shortAddress(l.seller) : "you"}</span>
                           </div>
                         );
                       })}
                     </div>
                   )}
+                  {cloud && <p className="empty" style={{ marginTop: 8 }}>💡 Buying &amp; bidding with SOL is coming next — listings are live now.</p>}
                 </>
               );
             })()}
@@ -1305,6 +1595,10 @@ export default function App() {
           losses={pet.battleLosses}
           coins={pet.coins}
           health={pet.stats.health}
+          arenaTop={arenaTop}
+          myWallet={wallet}
+          onlineEnabled={!!wallet && isCloudEnabled()}
+          fetchOpponent={() => (wallet ? findPvpOpponent(wallet) : Promise.resolve(null))}
         />
       )}
 

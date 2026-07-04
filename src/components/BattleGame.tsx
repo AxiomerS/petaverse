@@ -5,6 +5,8 @@ import { FOODS } from "../game/foods";
 import { RARITY, type Rarity } from "../game/rarity";
 import { PETS } from "../game/pets";
 import { loadoutPower, accPower, accHp, accCrit, type Loadout } from "../game/power";
+import { type ArenaRow, type PvpProfile } from "../game/cloud";
+import { shortAddress } from "../game/wallet";
 
 const BOT_NAMES = ["Ragefang", "Shadow", "Bolt", "Tank", "Nibbles", "Vortex", "Pixel", "Goliath", "Sneaky", "Turbo", "Mochi", "Crash", "Zephyr", "Onyx"];
 const TIPS = [
@@ -48,7 +50,7 @@ type Phase = "loadout" | "searching" | "flip" | "battle" | "loot" | "done";
 type Fighter = { name: string; species: string; level: number; accessories: string[] } & Loadout;
 type Loot = { kind: "accessory" | "food"; id: string; label: string; emoji: string; rarity: Rarity };
 
-export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level, accessories, loadout, powerBuffActive, wins, losses, coins, health }: {
+export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level, accessories, loadout, powerBuffActive, wins, losses, coins, health, arenaTop, myWallet, onlineEnabled, fetchOpponent }: {
   onClose: () => void;
   onWin: (kind: "accessory" | "food", id: string, bet: number) => void;
   onLose: (bet: number) => void;
@@ -62,6 +64,10 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
   losses: number;
   coins: number;
   health: number;
+  arenaTop: ArenaRow[] | null; // живой топ арены из Supabase (null → фейковый список)
+  myWallet: string | null;
+  onlineEnabled: boolean; // доступен ли онлайн-матч (кошелёк + облако)
+  fetchOpponent: () => Promise<PvpProfile | null>; // найти реального соперника
 }) {
   const [phase, setPhase] = useState<Phase>("loadout");
   const [bot, setBot] = useState<Fighter | null>(null);
@@ -76,9 +82,11 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
   const [arrowSpin, setArrowSpin] = useState(0); // угол стрелки «кто бьёт первым»
   const [bet, setBet] = useState(0); // ставка Sil на бой
   const [showRanks, setShowRanks] = useState(false); // показать ли ранкинг арены
+  const [onlineMatch, setOnlineMatch] = useState(false); // текущий бой — против реального игрока
   const timerRef = useRef(0);
   const resultedRef = useRef(false);
   const betRef = useRef(0); // зафиксированная ставка на текущий бой
+  const searchIdRef = useRef(0); // токен текущего поиска (для отмены/перезапуска)
   const [tip] = useState(() => TIPS[Math.floor(Math.random() * TIPS.length)]);
 
   const MIN_HP = 10; // нужно минимум 10 HP, чтобы выйти на арену
@@ -101,22 +109,55 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
     return { name: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)], species, level: lvl, accessories: accs, ...lo };
   }
 
-  function findOpponent() {
+  // Построить бойца из профиля реального игрока (его вид, уровень, снаряжение).
+  async function buildOnlineFighter(): Promise<Fighter | null> {
+    const prof = await fetchOpponent();
+    if (!prof) return null;
+    const lo = loadoutPower(prof.level, prof.accessories ?? [], 0);
+    return { name: (prof.name && prof.name.trim()) || "Rival", species: prof.species, level: prof.level, accessories: prof.accessories ?? [], ...lo };
+  }
+
+  // Запустить «бросок стрелки» и бой с готовым соперником.
+  function startFlip(b: Fighter, online: boolean) {
+    setOnlineMatch(online);
+    const first = Math.random() < 0.5; // кто бьёт первым
+    setBot(b);
+    setPMax(loadout.hp); setPHp(loadout.hp); setOMax(b.hp); setOHp(b.hp);
+    setArrowSpin(0);
+    setPhase("flip");
+    requestAnimationFrame(() => setArrowSpin(360 * 5 + (first ? 180 : 0)));
+    timerRef.current = window.setTimeout(() => startBattle(b, first), 2000);
+  }
+
+  // Найти соперника. Онлайн: ищем реального игрока до 2 минут, потом ТИХО подставляем бота.
+  // Без облака: сразу бот (искать негде).
+  const ONLINE_TIMEOUT = 120000; // 2 минуты
+  function beginMatch() {
     if (!canFight) return;
     betRef.current = Math.min(bet, coins); // фиксируем ставку на этот бой
+    const myId = ++searchIdRef.current;
     setPhase("searching");
-    timerRef.current = window.setTimeout(() => {
-      const b = makeBot();
-      const first = Math.random() < 0.5; // кто бьёт первым
-      setBot(b);
-      // полные HP-полоски на время «броска» стрелки
-      setPMax(loadout.hp); setPHp(loadout.hp); setOMax(b.hp); setOHp(b.hp);
-      setArrowSpin(0);
-      setPhase("flip");
-      // на следующем кадре запускаем вращение: стрелка укажет на первого бойца
-      requestAnimationFrame(() => setArrowSpin(360 * 5 + (first ? 180 : 0)));
-      timerRef.current = window.setTimeout(() => startBattle(b, first), 2000);
-    }, 1300);
+    if (!onlineEnabled) {
+      timerRef.current = window.setTimeout(() => { if (searchIdRef.current === myId) startFlip(makeBot(), false); }, 900);
+      return;
+    }
+    const deadline = Date.now() + ONLINE_TIMEOUT;
+    const poll = () => {
+      buildOnlineFighter().then((found) => {
+        if (searchIdRef.current !== myId) return; // поиск отменён/перезапущен
+        if (found) return startFlip(found, true); // нашли реального игрока
+        if (Date.now() >= deadline) return startFlip(makeBot(), false); // 2 мин без соперника → бот
+        timerRef.current = window.setTimeout(poll, 4000); // подождём и попробуем снова
+      });
+    };
+    poll();
+  }
+
+  // Отменить поиск и вернуться в лоадаут.
+  function cancelSearch() {
+    searchIdRef.current++; // сбрасываем текущий поиск
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setPhase("loadout");
   }
 
   function startBattle(b: Fighter, first: boolean) {
@@ -185,18 +226,35 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
   return (
     <div className="scrim" onClick={() => phase !== "battle" && onClose()}>
       <div className="modal modal-xl battle-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head"><h3>⚔️ Battle Arena <span className="wip-badge">BOTS</span></h3></div>
+        <div className="modal-head"><h3>⚔️ Battle Arena <span className="wip-badge">{onlineEnabled ? "PvP" : "BOTS"}</span></h3></div>
 
         {phase === "loadout" && showRanks && (() => {
-          // Ранкинг арены: боты + сам игрок, отсортированные по винрейту, затем по силе.
           const rate = (w: number, l: number) => (w + l ? w / (w + l) : 0);
-          const me = { name: `${petName} (you)`, wins, losses, species: petSpecies, power: loadout.power, you: true };
-          const rows = [...ARENA_PLAYERS.map((p) => ({ ...p, you: false })), me]
-            .sort((a, b) => rate(b.wins, b.losses) - rate(a.wins, a.losses) || b.power - a.power)
-            .slice(0, 20);
+          type Row = { key: string; name: string; wins: number; losses: number; species: string; power: number; you: boolean };
+          let rows: Row[];
+          const real = arenaTop !== null; // живой топ из Supabase
+          if (arenaTop) {
+            // Порядок уже задан запросом (по победам, затем по силе).
+            rows = arenaTop.map((p) => ({
+              key: p.wallet,
+              name: (p.name && p.name.trim()) || shortAddress(p.wallet),
+              wins: p.wins, losses: p.losses, species: p.species, power: p.power,
+              you: !!myWallet && p.wallet === myWallet,
+            }));
+            if (myWallet && !rows.some((r) => r.you)) {
+              rows.push({ key: myWallet, name: petName, wins, losses, species: petSpecies, power: loadout.power, you: true });
+            }
+          } else {
+            const me: Row = { key: "you", name: petName, wins, losses, species: petSpecies, power: loadout.power, you: true };
+            rows = [...ARENA_PLAYERS.map((p) => ({ key: p.name, name: p.name, wins: p.wins, losses: p.losses, species: p.species, power: p.power, you: false })), me]
+              .sort((a, b) => b.wins - a.wins || b.power - a.power)
+              .slice(0, 20);
+          }
           return (
             <div className="bt-ranks">
-              <p className="subtitle" style={{ marginTop: -4 }}>Top 20 fighters by winrate &amp; pet power.</p>
+              <p className="subtitle" style={{ marginTop: -4 }}>
+                {real ? "Global top fighters — most wins first." : "Top fighters by wins & pet power."}
+              </p>
               <div className="bt-ranklist">
                 <div className="bt-rankhead">
                   <span className="bt-rk">#</span>
@@ -204,15 +262,20 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
                   <span className="bt-rw">Winrate</span>
                   <span className="bt-rp">⚔️ Power</span>
                 </div>
-                {rows.map((r, i) => (
-                  <div key={r.name} className={"bt-rankrow" + (r.you ? " bt-rankrow-you" : "")}>
-                    <span className="bt-rk">{i + 1}</span>
-                    <span className="bt-rn"><PetArt species={r.species} size={22} /> {r.name}</span>
-                    <span className="bt-rw">{Math.round(rate(r.wins, r.losses) * 100)}%</span>
-                    <span className="bt-rp">{r.power}</span>
-                  </div>
-                ))}
+                {rows.length === 0 ? (
+                  <div className="bt-rankrow"><span className="bt-rn">No fighters yet — win a battle! ⚔️</span></div>
+                ) : (
+                  rows.map((r, i) => (
+                    <div key={r.key} className={"bt-rankrow" + (r.you ? " bt-rankrow-you" : "")}>
+                      <span className="bt-rk">{i + 1}</span>
+                      <span className="bt-rn"><PetArt species={r.species} size={22} /> {r.name}{r.you ? " (you)" : ""}</span>
+                      <span className="bt-rw">{Math.round(rate(r.wins, r.losses) * 100)}%</span>
+                      <span className="bt-rp">{r.power}</span>
+                    </div>
+                  ))
+                )}
               </div>
+              {real && !myWallet && <p className="bt-tip">🔌 Connect your wallet to join the global arena ranking.</p>}
               <button className="btn btn-ghost" onClick={() => setShowRanks(false)}>← Back</button>
             </div>
           );
@@ -268,8 +331,8 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
             </div>
 
             {canFight ? (
-              <button className="btn btn-primary bt-find" onClick={findOpponent}>
-                🔍 Find opponent{bet > 0 ? ` · bet ${bet}` : ""}
+              <button className="btn btn-primary bt-find" onClick={beginMatch}>
+                {onlineEnabled ? "🌐 Find opponent" : "🔍 Find opponent"}{bet > 0 ? ` · bet ${bet}` : ""}
               </button>
             ) : (
               <button className="btn btn-primary bt-find" disabled>❤️ Needs {MIN_HP}+ HP to fight</button>
@@ -293,7 +356,12 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
         )}
 
         {phase === "searching" && (
-          <div className="bt-searching"><div className="bt-spinner">⚔️</div><p className="subtitle">Searching for an opponent…</p></div>
+          <div className="bt-searching">
+            <div className="bt-spinner">⚔️</div>
+            <p className="subtitle">{onlineEnabled ? "Searching for an online opponent…" : "Finding an opponent…"}</p>
+            {onlineEnabled && <p className="bt-tip">Matches a real player. A bot only fills in if none appear within 2 min.</p>}
+            <button className="btn btn-ghost" onClick={cancelSearch}>Cancel</button>
+          </div>
         )}
 
         {(phase === "flip" || phase === "battle" || phase === "done") && bot && (
@@ -315,7 +383,7 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
             )}
             <div className="bt-side">
               <span key={`o-${turn}`} className={"bt-petwrap" + (flash?.attacker === "o" ? " bt-lunge-l" : flash?.side === "o" ? " bt-hurt" : "")}><PetArt species={bot.species} size={84} /></span>
-              <div className="bt-name">{bot.name} · Lv {bot.level}</div>
+              <div className="bt-name">{bot.name} · Lv {bot.level}{onlineMatch ? " 🌐" : ""}</div>
               {gearRow(bot.accessories)}
               <div className="bt-hpbar"><div className="bt-hpfill bt-hp-o" style={{ width: `${(oHp / oMax) * 100}%` }} /></div>
               <div className="bt-hpnum">❤️ {oHp} / {oMax}</div>
