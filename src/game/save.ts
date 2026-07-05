@@ -35,7 +35,8 @@ export type SavedPet = {
   powerBuff: { amount: number; expiresAt: number } | null; // временная прибавка силы от еды (Игра №2)
   potionInv: Record<string, number>; // купленные зелья (potionId → количество)
   potions: ActivePotion[]; // активные (выпитые) зелья с временем истечения
-  questClaimed: string[]; // id забранных/закрытых квестов
+  questClaimed: string[]; // id скрытых (закрытых крестиком) квестов
+  questDone: string[]; // id забранных квестов (награда запрошена) — показываются перечёркнутыми
   listings: MarketListing[]; // выставленные игроком лоты (продажа/аукцион)
   // Сохранённый прогресс НЕактивных питомцев (активный живёт в полях выше).
   progress: Record<string, { stats: Stats; xp: number; level: number; buffs: { kind: BuffKind; expiresAt: number }[] }>;
@@ -92,6 +93,7 @@ export function loadPet(): SavedPet | null {
       potionInv: p.potionInv ?? {},
       potions: (p.potions ?? []).filter((x) => x.expiresAt > now),
       questClaimed: p.questClaimed ?? [],
+      questDone: p.questDone ?? [],
       listings: p.listings ?? [],
       progress: p.progress ?? {},
       lastDaily: p.lastDaily ?? 0,
@@ -106,4 +108,39 @@ export function loadPet(): SavedPet | null {
   } catch {
     return null;
   }
+}
+
+// Дозаполнить сейв дефолтами (для сейвов из ОБЛАКА — старые записи могут не иметь новых полей,
+// иначе доступ к отсутствующему полю, напр. questDone.includes(), крашит рендер). Без decay-логики.
+export function hydrateSave(p: any): SavedPet {
+  return {
+    species: p.species,
+    name: p.name,
+    names: p.names ?? { [p.species]: p.name },
+    stats: p.stats,
+    coins: p.coins ?? START_COINS,
+    sol: p.sol ?? 0,
+    inventory: p.inventory ?? {},
+    ownedSpecies: p.ownedSpecies ?? [p.species],
+    ownedAccessories: p.ownedAccessories ?? [...STARTER_ACCESSORIES],
+    accessories: p.accessories ?? [],
+    xp: p.xp ?? 0,
+    level: p.level ?? 1,
+    buffs: p.buffs ?? [],
+    powerBuff: p.powerBuff ?? null,
+    potionInv: p.potionInv ?? {},
+    potions: p.potions ?? [],
+    questClaimed: p.questClaimed ?? [],
+    questDone: p.questDone ?? [],
+    listings: p.listings ?? [],
+    progress: p.progress ?? {},
+    lastDaily: p.lastDaily ?? 0,
+    totalScore: p.totalScore ?? 0,
+    bestScore: p.bestScore ?? 0,
+    lastRunReward: p.lastRunReward ?? 0,
+    battleWins: p.battleWins ?? 0,
+    battleLosses: p.battleLosses ?? 0,
+    grantV: p.grantV ?? GRANT_V,
+    updatedAt: p.updatedAt ?? Date.now(),
+  };
 }

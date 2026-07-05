@@ -7,12 +7,12 @@ import { loadoutPower, activePowerBuff, accPower, accHp, accCrit } from "./game/
 import { ACCESSORIES, accById, SLOTS, STARTER_ACCESSORIES, equippedBonuses, accDesc, mythicAcc } from "./game/accessories";
 import { BUFFS, type BuffKind } from "./game/buffs";
 import { FOOD_CHESTS, ACC_CHESTS, PET_CHESTS, bestTier, fmtChance, type PoolItem } from "./game/chests";
-import { type Stats, clamp, xpForLevel, decay, decayMult, silRate, statCap, DAILY_REWARD, DAILY_COOLDOWN, START_COINS, GRANT_V } from "./game/mechanics";
+import { type Stats, clamp, xpForLevel, decay, decayMult, silRate, levelSilMult, statCap, DAILY_REWARD, DAILY_COOLDOWN, START_COINS, GRANT_V } from "./game/mechanics";
 import { POTIONS, potionById, potionEffects, potionTitle, type Potion } from "./game/potions";
 import { QUESTS } from "./game/quests";
-import { type SavedPet, STORAGE_KEY, loadPet, type MarketListing } from "./game/save";
+import { type SavedPet, STORAGE_KEY, loadPet, hydrateSave, type MarketListing } from "./game/save";
 import { getPhantom, shortAddress, signMessageHex, PHANTOM_INSTALL_URL } from "./game/wallet";
-import { isCloudEnabled, loadCloudSave, saveCloudSave, submitScore, fetchTopScores, submitArena, fetchTopArena, upsertPvpProfile, findPvpOpponent, fetchListings, createListing, deleteListing, confirmMarketBuy, fetchExclusives, createExclusive, deleteExclusive, signIn, setSessionToken, confirmPurchase, requestSell, fetchSellRequests, payoutSell, type ScoreRow, type ArenaRow, type Listing, type Exclusive, type SellRequest } from "./game/cloud";
+import { isCloudEnabled, loadCloudSave, saveCloudSave, submitScore, fetchTopScores, submitArena, fetchTopArena, upsertPvpProfile, findPvpOpponent, fetchListings, createListing, deleteListing, confirmMarketBuy, fetchExclusives, createExclusive, deleteExclusive, createQuestClaim, fetchQuestClaims, markQuestClaimPaid, signIn, setSessionToken, confirmPurchase, requestSell, fetchSellRequests, fetchStuckSellRequests, payoutSell, type ScoreRow, type ArenaRow, type Listing, type Exclusive, type SellRequest, type QuestClaim } from "./game/cloud";
 import { sendSolPayment, SOL_PV_RATE, SOL_BUY_PACKS, SOL_SELL_RATE, SOL_SELL_PACKS, SOL_MARKET_FEE_BPS } from "./game/pay";
 import { SPIN_MS, playSpinSound, playWinSound } from "./game/audio";
 import { Coin, StatBar } from "./components/ui";
@@ -96,6 +96,8 @@ export default function App() {
   const [verified, setVerified] = useState(false); // подтверждён ли кошелёк подписью
   const [buying, setBuying] = useState(false); // идёт ли покупка PV за SOL
   const [adminReqs, setAdminReqs] = useState<SellRequest[] | null>(null); // pending-заявки на продажу (для админа)
+  const [adminQuests, setAdminQuests] = useState<QuestClaim[] | null>(null); // pending-заявки на награды за квесты (для админа)
+  const [adminStuck, setAdminStuck] = useState<SellRequest[] | null>(null); // застрявшие выплаты (error/paying)
   const [payoutBusy, setPayoutBusy] = useState(false); // идёт обработка выплаты (блок от двойного клика Approve/Reject)
   const [listBusy, setListBusy] = useState(false); // идёт выставление лота (блок от двойного клика List)
   const isAdmin = wallet === ADMIN_WALLET;
@@ -148,7 +150,7 @@ export default function App() {
       // Пассивный Sil копится ТОЛЬКО пока приложение активно тикает: засчитываем не больше
       // одного интервала тика (≤5с) — так доход не набегает за фон/оффлайн. Зелье Sil усиливает доход.
       const earnMs = Math.min(now - cur.updatedAt, 5000);
-      const earned = (earnMs / 60000) * silRate(cur.accessories, cur.species) * (1 + potEff.sil);
+      const earned = (earnMs / 60000) * silRate(cur.accessories, cur.species) * (1 + potEff.sil) * levelSilMult(cur.level);
       // Decay, then add mythic regen (leash→fullness, toy→happiness). Cap растёт с уровнем.
       // Зелье Vitality замедляет распад (множим итоговый decayMult на (1 − potEff.decay)).
       const cap = statCap(cur.level);
@@ -217,9 +219,10 @@ export default function App() {
     loadCloudSave(wallet)
       .then((cloud) => {
         if (cancelled) return;
-        if (cloud) setPet(cloud); // облачный питомец этого кошелька — источник правды
+        const cloudPet = cloud ? hydrateSave(cloud) : null; // дозаполняем дефолтами (старые сейвы без новых полей)
+        if (cloudPet) setPet(cloudPet); // облачный питомец этого кошелька — источник правды
         else if (petRef.current) saveCloudSave(wallet, petRef.current); // у кошелька сейва нет → заливаем локального
-        const p = cloud ?? petRef.current;
+        const p = cloudPet ?? petRef.current;
         if (p && p.bestScore > 0) submitScore(wallet, p.name, p.bestScore); // засветиться в лидерборде
         if (p && p.battleWins + p.battleLosses > 0)
           submitArena({ wallet, name: p.name, species: p.species, power: loadoutPower(p.level, p.accessories, 0).power, wins: p.battleWins, losses: p.battleLosses });
@@ -251,12 +254,16 @@ export default function App() {
     return () => { cancelled = true; };
   }, [modal]);
 
-  // Админ: подгружаем pending-заявки на продажу при открытии админ-панели.
+  // Админ: подгружаем pending-заявки на продажу и на награды за квесты при открытии админ-панели.
   useEffect(() => {
     if (modal !== "admin" || !isAdmin) return;
     let cancelled = false;
     setAdminReqs(null);
+    setAdminQuests(null);
+    setAdminStuck(null);
     fetchSellRequests("pending").then((rows) => { if (!cancelled) setAdminReqs(rows ?? []); });
+    fetchQuestClaims("pending").then((rows) => { if (!cancelled) setAdminQuests(rows ?? []); });
+    fetchStuckSellRequests().then((rows) => { if (!cancelled) setAdminStuck(rows ?? []); });
     return () => { cancelled = true; };
   }, [modal, isAdmin]);
 
@@ -314,6 +321,7 @@ export default function App() {
       potionInv: {},
       potions: [],
       questClaimed: [],
+      questDone: [],
       listings: [],
       progress: {},
       lastDaily: 0,
@@ -626,17 +634,32 @@ export default function App() {
     setBuying(false);
   }
 
-  // Админ подтверждает (выплата SOL с казны) или отклоняет (возврат PV) заявку.
-  async function doPayout(id: string, action: "approve" | "reject") {
+  // Админ: approve (выплата SOL), reject (возврат PV для kind='sell') или reset (застрявшую → в очередь).
+  async function doPayout(id: string, action: "approve" | "reject" | "reset") {
     if (payoutBusy) return; // защита от двойного клика (сервер тоже атомарно защищён)
     setPayoutBusy(true);
-    setToast(action === "approve" ? "Sending SOL from treasury…" : "Rejecting…");
+    setToast(action === "approve" ? "Sending SOL from treasury…" : action === "reject" ? "Rejecting…" : "Resetting…");
     const res = await payoutSell(id, action);
     if ("ok" in res) {
-      setToast(action === "approve" ? `✅ Paid out${res.sig ? ` (${shortAddress(res.sig)})` : ""}` : "↩️ Rejected — PV refunded");
+      setToast(action === "approve" ? `✅ Paid out${res.sig ? ` (${shortAddress(res.sig)})` : ""}` : action === "reject" ? "↩️ Rejected — PV refunded" : "↩️ Reset to pending");
       fetchSellRequests("pending").then((rows) => setAdminReqs(rows ?? []));
+      fetchStuckSellRequests().then((rows) => setAdminStuck(rows ?? []));
     } else {
       setToast(`Failed: ${res.error}`);
+    }
+    setPayoutBusy(false);
+  }
+
+  // Админ: отметить заявку на награду за квест выплаченной (SOL отправляется вручную из кошелька казны).
+  async function doQuestPaid(id: string) {
+    if (payoutBusy) return;
+    setPayoutBusy(true);
+    const ok = await markQuestClaimPaid(id);
+    if (ok) {
+      setToast("✅ Marked paid");
+      fetchQuestClaims("pending").then((rows) => setAdminQuests(rows ?? []));
+    } else {
+      setToast("Failed to mark paid");
     }
     setPayoutBusy(false);
   }
@@ -779,9 +802,14 @@ export default function App() {
     setPet({ ...pet, accessories: next });
   }
 
+  // Награды (daily/рулетка) — только для подключённого+верифицированного кошелька: тогда кулдаун
+  // и баланс PV живут в облаке per-wallet, и абузер не сбросит их, очистив localStorage/создав
+  // новый локальный «аккаунт» (для нового старта нужен реально новый кошелёк Phantom — это трение).
+  const rewardsUnlocked = !!wallet && verified;
   const dailyReady = pet ? Date.now() - pet.lastDaily >= DAILY_COOLDOWN : false;
   function claimDaily() {
     if (!pet || !dailyReady) return;
+    if (!rewardsUnlocked) return setToast("Connect & verify your wallet to claim daily rewards");
     const sp = speciesEffect(pet.species);
     const potEff = potionEffects(pet.potions, Date.now());
     const dailyMult = equippedBonuses(pet.accessories).daily * (1 + sp.acc) + sp.daily + potEff.daily;
@@ -809,11 +837,18 @@ export default function App() {
     setToast(`${p.emoji} ${p.label} active — ${p.desc}`);
   }
 
-  // Забрать награду за выполненный квест (в SOL) и убрать его из списка.
-  function claimQuest(id: string, reward: number) {
-    if (!pet || pet.questClaimed.includes(id)) return;
-    setPet({ ...pet, sol: +(pet.sol + reward).toFixed(4), questClaimed: [...pet.questClaimed, id], updatedAt: Date.now() });
-    setToast(`✅ Quest complete! +◎${reward} SOL`);
+  // Забрать награду за квест: создаём заявку (сервер), квест становится перечёркнутым.
+  // Награду (реальный SOL) админ отправляет вручную из казны, посмотрев заявки в админ-панели.
+  async function claimQuest(id: string, reward: number) {
+    if (!pet || pet.questDone.includes(id)) return;
+    if (!wallet || !isCloudEnabled()) return setToast("Connect your wallet to claim quest rewards");
+    if (!verified) return setToast("Verify your wallet first (wallet menu)");
+    const ok = await createQuestClaim(wallet, id);
+    if (!ok) return setToast("Couldn't submit claim — try again");
+    const updated = { ...pet, questDone: [...pet.questDone, id], updatedAt: Date.now() };
+    setPet(updated);
+    saveCloudSave(wallet, updated);
+    setToast(`✅ Quest reward requested: ◎${reward} SOL — sent after admin review`);
   }
   // Закрыть (скрыть) квест локально. Общее для всех игроков закрытие — с бэкендом.
   function dismissQuest(id: string) {
@@ -847,7 +882,14 @@ export default function App() {
     if (wallet && isCloudEnabled()) {
       setPet(base);
       saveCloudSave(wallet, base); // сразу фиксируем изъятие, чтобы автосейв не вернул пета
-      await createListing({ id, seller: wallet, kind: "sale", species, level: lvl, buffs, price: askPrice, name });
+      const ok = await createListing({ id, seller: wallet, kind: "sale", species, level: lvl, buffs, price: askPrice, name });
+      if (!ok) {
+        // Лот не создался → откатываем эскроу (иначе пет потерян: изъят, но не выставлен).
+        setPet(pet);
+        saveCloudSave(wallet, pet);
+        setListBusy(false);
+        return setToast("Couldn't list — pet returned to you");
+      }
       fetchListings("sale").then(setMarketListings);
     } else {
       // Локальный лот (без облака) — виден только тебе.
@@ -885,9 +927,20 @@ export default function App() {
         setToast("This pet was already sold");
       }
     } else {
+      // Локальный лот: снимаем лот И возвращаем пета одним обновлением (два setPet затёрли бы друг друга).
       const lot = pet.listings.find((l) => l.id === id);
-      setPet({ ...pet, listings: pet.listings.filter((l) => l.id !== id) });
-      if (lot) restorePet(lot.species, lot.level, lot.buffs ?? []);
+      const listings = pet.listings.filter((l) => l.id !== id);
+      if (lot && !pet.ownedSpecies.includes(lot.species)) {
+        setPet({
+          ...pet,
+          listings,
+          ownedSpecies: [...pet.ownedSpecies, lot.species],
+          progress: { ...pet.progress, [lot.species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: lot.level || 1, buffs: lot.buffs ?? [] } },
+          updatedAt: Date.now(),
+        });
+      } else {
+        setPet({ ...pet, listings });
+      }
     }
   }
 
@@ -906,17 +959,27 @@ export default function App() {
       setToast("Verifying payment on-chain…");
       const res = await confirmMarketBuy("sale", listing.id, sig, wallet);
       if ("save" in res) {
-        // Берём из ответа только смену владения — свой локальный прогресс (монеты и т.п.) сохраняем.
+        // Аддитивно добавляем ТОЛЬКО купленного вида — иначе затрём петов, полученных локально
+        // за последние ≤20с (сундук/разведение), которых ещё нет в облачном сейве сервера.
+        const sp = listing.species;
         setPet((p) => {
-          if (!p) return res.save;
-          const merged = { ...p, ownedSpecies: res.save.ownedSpecies, progress: res.save.progress, names: res.save.names, updatedAt: Date.now() };
+          if (!p) return hydrateSave(res.save);
+          if (p.ownedSpecies.includes(sp)) return p;
+          const prog = res.save.progress?.[sp] ?? { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: 1, buffs: [] };
+          const merged = {
+            ...p,
+            ownedSpecies: [...p.ownedSpecies, sp],
+            progress: { ...p.progress, [sp]: prog },
+            names: res.save.names?.[sp] ? { ...p.names, [sp]: res.save.names[sp] } : p.names,
+            updatedAt: Date.now(),
+          };
           if (wallet) saveCloudSave(wallet, merged);
           return merged;
         });
         setToast(`✅ Bought ${label}! It's in your collection.`);
         fetchListings("sale").then(setMarketListings);
       } else {
-        setToast(`Paid, but transfer failed: ${res.error}`);
+        setToast(res.error.includes("refund") ? `Couldn't complete — your SOL will be refunded (${res.error.replace(" — refund queued", "")})` : `Paid, but transfer failed: ${res.error}`);
       }
     } catch {
       setToast("Purchase failed");
@@ -938,16 +1001,26 @@ export default function App() {
       setToast("Verifying payment on-chain…");
       const res = await confirmMarketBuy("exclusive", ex.id, sig, wallet);
       if ("save" in res) {
+        // Аддитивно (см. buyPet): добавляем только купленный вид, не затирая локальный прогресс.
+        const sp = ex.species;
         setPet((p) => {
-          if (!p) return res.save;
-          const merged = { ...p, ownedSpecies: res.save.ownedSpecies, progress: res.save.progress, names: res.save.names, updatedAt: Date.now() };
+          if (!p) return hydrateSave(res.save);
+          if (p.ownedSpecies.includes(sp)) return p;
+          const prog = res.save.progress?.[sp] ?? { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: 1, buffs: [] };
+          const merged = {
+            ...p,
+            ownedSpecies: [...p.ownedSpecies, sp],
+            progress: { ...p.progress, [sp]: prog },
+            names: res.save.names?.[sp] ? { ...p.names, [sp]: res.save.names[sp] } : p.names,
+            updatedAt: Date.now(),
+          };
           if (wallet) saveCloudSave(wallet, merged);
           return merged;
         });
         setToast(`✨ Bought exclusive ${label}!`);
         fetchExclusives().then(setExclusives);
       } else {
-        setToast(`Paid, but grant failed: ${res.error}`);
+        setToast(res.error.includes("refund") ? `Couldn't complete — your SOL will be refunded (${res.error.replace(" — refund queued", "")})` : `Paid, but grant failed: ${res.error}`);
       }
     } catch {
       setToast("Purchase failed");
@@ -994,7 +1067,7 @@ export default function App() {
   const breedEligible = pet ? pet.ownedSpecies.filter((id) => petLevel(id) >= BREED_LEVEL) : [];
   // Активные эффекты зелий (для показа ставки Sil/мин и силы арены).
   const potEff = pet ? potionEffects(pet.potions, Date.now()) : { sil: 0, power: 0, decay: 0, xp: 0, daily: 0 };
-  const silPerMin = pet ? silRate(pet.accessories, pet.species) * (1 + potEff.sil) : 0;
+  const silPerMin = pet ? silRate(pet.accessories, pet.species) * (1 + potEff.sil) * levelSilMult(pet.level) : 0;
   // Прогресс квеста по его метрике (выводится из полей сейва).
   function questValue(metric: string): number {
     if (!pet) return 0;
@@ -1005,7 +1078,9 @@ export default function App() {
     if (metric === "coins") return Math.floor(pet.coins);
     return 0;
   }
-  const activeQuests = pet ? QUESTS.filter((q) => !pet.questClaimed.includes(q.id)) : [];
+  // Открытые квесты (ещё не забраны и не скрыты) и забранные (перечёркнутые, ждут выплаты).
+  const activeQuests = pet ? QUESTS.filter((q) => !pet.questClaimed.includes(q.id) && !pet.questDone.includes(q.id)) : [];
+  const doneQuests = pet ? QUESTS.filter((q) => pet.questDone.includes(q.id) && !pet.questClaimed.includes(q.id)) : [];
 
   function mood(s: Stats): string {
     if (s.health <= 0) return "is very sick… take care of me!";
@@ -1101,7 +1176,7 @@ export default function App() {
             )}
           </div>
           {pet && (
-            <span className="balance-pill" title={`+${+silPerMin.toFixed(2)} ${SIL}/min passive`}>
+            <span className="balance-pill" title={`+${+silPerMin.toFixed(2)} ${SIL}/min passive · Lv ${pet.level} ×${levelSilMult(pet.level).toFixed(1)}`}>
               <Coin />
               <span className="balance-amt">{Math.floor(pet.coins).toLocaleString()}</span>
               <span className="balance-cur">{SIL}</span>
@@ -1255,13 +1330,13 @@ export default function App() {
                   <button className="btn btn-primary" onClick={() => setModal("inventory")}>🎒 Inventory</button>
                   <button className="btn btn-secondary" onClick={() => setModal("shop")}>🛒 Shop</button>
                   <button className="btn btn-secondary" onClick={() => setModal("playmenu")}>🎾 Play</button>
-                  <button className="btn btn-secondary" onClick={() => setModal("roulette")}>🎰 Roulette</button>
+                  <button className="btn btn-secondary" onClick={() => rewardsUnlocked ? setModal("roulette") : setToast("Connect & verify your wallet to play the roulette")}>🎰 Roulette</button>
                   <button className="btn btn-secondary" onClick={() => setModal("breed")}>🧬 Breed</button>
                   <button className="btn btn-secondary" onClick={() => setModal("leaderboard")}>🏆 Ranks</button>
                 </div>
 
-                <button className="btn btn-daily" disabled={!dailyReady} onClick={claimDaily}>
-                  {dailyReady ? `🎁 Claim daily +${DAILY_REWARD} ${SIL}` : `🎁 Daily in ${dailyLeft()}`}
+                <button className="btn btn-daily" disabled={!dailyReady || !rewardsUnlocked} onClick={claimDaily} title={!rewardsUnlocked ? "Connect & verify your wallet to claim daily rewards" : undefined}>
+                  {!rewardsUnlocked ? "🎁 Connect wallet for daily" : dailyReady ? `🎁 Claim daily +${DAILY_REWARD} ${SIL}` : `🎁 Daily in ${dailyLeft()}`}
                 </button>
               </>
             )}
@@ -1283,7 +1358,7 @@ export default function App() {
       </div>
 
       {/* ===== Quests (bottom-right, collapsible) ===== */}
-      {pet && !dead && !modal && !petMenu && activeQuests.length > 0 && (
+      {pet && !dead && !modal && !petMenu && (activeQuests.length > 0 || doneQuests.length > 0) && (
         <div className={"quest-panel" + (questsOpen ? "" : " quest-panel-closed")}>
           <button className="quest-head" onClick={() => setQuestsOpen((o) => !o)} title={questsOpen ? "Hide quests" : "Show quests"}>
             <span>📋 Quests ({activeQuests.length})</span>
@@ -1310,6 +1385,25 @@ export default function App() {
               </div>
             );
           })}
+          {/* Забранные квесты: перечёркнуты, ждут ручной выплаты SOL от админа. Показываем твой кошелёк. */}
+          {questsOpen && doneQuests.map((q) => (
+            <div key={q.id} className="quest-row quest-row-done">
+              <div className="quest-top">
+                <span className="quest-label quest-label-done">{q.emoji} {q.label}</span>
+                <button className="quest-x" onClick={() => dismissQuest(q.id)} title="Hide">✕</button>
+              </div>
+              <div className="quest-prog">✅ Reward ◎{q.reward} SOL — awaiting payout</div>
+              {wallet && (
+                <button
+                  className="quest-wallet"
+                  title="Copy your wallet (reward is sent here)"
+                  onClick={() => { navigator.clipboard?.writeText(wallet); setToast("Address copied"); }}
+                >
+                  📋 {shortAddress(wallet)}
+                </button>
+              )}
+            </div>
+          ))}
         </div>
       )}
 
@@ -1936,7 +2030,7 @@ export default function App() {
         <div className="scrim" onClick={() => setModal(null)}>
           <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head"><h3>🛠️ Payout requests</h3></div>
-            <p className="subtitle" style={{ marginTop: -4 }}>Approve to pay SOL from the treasury. PV sells can be rejected (refunds PV); pet sales are final.</p>
+            <p className="subtitle" style={{ marginTop: -4 }}>Approve to pay SOL from the treasury. Only PV sells can be rejected (refunds PV); pet sales &amp; refunds are final.</p>
             {adminReqs === null ? (
               <p className="empty">Loading…</p>
             ) : adminReqs.length === 0 ? (
@@ -1944,22 +2038,69 @@ export default function App() {
             ) : (
               <div className="lb-list">
                 {adminReqs.map((r) => {
-                  const isMarket = r.kind === "market";
+                  // sell = продажа PV (можно reject→возврат PV); market = продажа пета; refund = возврат неуд. покупки.
+                  const label = r.kind === "market" ? `🏷️ Pet sale → ◎${r.sol}` : r.kind === "refund" ? `↩️ Refund → ◎${r.sol}` : null;
                   return (
                     <div key={r.id} className="admin-req">
                       <div className="admin-req-info">
-                        <span className="admin-req-amt">{isMarket ? `🏷️ Pet sale → ◎${r.sol}` : <><Coin /> {r.pv.toLocaleString()} → ◎{r.sol}</>}</span>
-                        <span className="admin-req-who" title={r.wallet}>{shortAddress(r.wallet)}</span>
+                        <span className="admin-req-amt">{label ?? <><Coin /> {r.pv.toLocaleString()} → ◎{r.sol}</>}</span>
+                        <button className="admin-req-who quest-wallet" title="Copy wallet" onClick={() => { navigator.clipboard?.writeText(r.wallet); setToast("Address copied"); }}>📋 {shortAddress(r.wallet)}</button>
                       </div>
                       <div className="admin-req-btns">
                         <button className="btn btn-primary admin-ok" disabled={payoutBusy} onClick={() => doPayout(r.id, "approve")}>Approve</button>
-                        {!isMarket && <button className="btn btn-ghost admin-no" disabled={payoutBusy} onClick={() => doPayout(r.id, "reject")}>Reject</button>}
+                        {r.kind === "sell" && <button className="btn btn-ghost admin-no" disabled={payoutBusy} onClick={() => doPayout(r.id, "reject")}>Reject</button>}
                       </div>
                     </div>
                   );
                 })}
               </div>
             )}
+
+            {adminStuck && adminStuck.length > 0 && (
+              <>
+                <div className="section-label" style={{ marginTop: 14 }}>⚠️ Stuck payouts</div>
+                <p className="subtitle" style={{ marginTop: -4 }}>A payout failed mid-send. Check the treasury tx history first — if no SOL left, Reset to retry.</p>
+                <div className="lb-list">
+                  {adminStuck.map((r) => (
+                    <div key={r.id} className="admin-req">
+                      <div className="admin-req-info">
+                        <span className="admin-req-amt">◎{r.sol} · <b>{r.status}</b></span>
+                        <button className="admin-req-who quest-wallet" title="Copy wallet" onClick={() => { navigator.clipboard?.writeText(r.wallet); setToast("Address copied"); }}>📋 {shortAddress(r.wallet)}</button>
+                      </div>
+                      <div className="admin-req-btns">
+                        <button className="btn btn-ghost" disabled={payoutBusy} onClick={() => doPayout(r.id, "reset")}>Reset</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            <div className="section-label" style={{ marginTop: 14 }}>🎯 Quest rewards</div>
+            <p className="subtitle" style={{ marginTop: -4 }}>Copy the wallet, send the SOL from the treasury yourself, then Mark paid.</p>
+            {adminQuests === null ? (
+              <p className="empty">Loading…</p>
+            ) : adminQuests.length === 0 ? (
+              <p className="empty">No pending quest rewards 🎉</p>
+            ) : (
+              <div className="lb-list">
+                {adminQuests.map((c) => {
+                  const q = QUESTS.find((x) => x.id === c.quest_id);
+                  return (
+                    <div key={c.id} className="admin-req">
+                      <div className="admin-req-info">
+                        <span className="admin-req-amt">{q ? `${q.emoji} ${q.label}` : c.quest_id} → ◎{q?.reward ?? "?"}</span>
+                        <button className="admin-req-who quest-wallet" title="Copy wallet" onClick={() => { navigator.clipboard?.writeText(c.wallet); setToast("Address copied"); }}>📋 {shortAddress(c.wallet)}</button>
+                      </div>
+                      <div className="admin-req-btns">
+                        <button className="btn btn-primary admin-ok" disabled={payoutBusy} onClick={() => doQuestPaid(c.id)}>Mark paid</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
             <button className="btn btn-ghost" onClick={() => setModal(null)}>Close</button>
           </div>
         </div>

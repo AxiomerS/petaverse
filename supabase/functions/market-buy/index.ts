@@ -74,7 +74,27 @@ Deno.serve(async (req) => {
     const paid = Number(tx.meta.postBalances[tIdx]) - Number(tx.meta.preBalances[tIdx]);
     if (paid <= 0) return jsonResp({ error: "no payment to treasury" }, 400);
 
-    // 2) Находим лот/эксклюзив и его цену.
+    // 2) ЗАПИСЫВАЕМ ПЛАТЁЖ ПЕРВЫМ (signature — PK): дедуп + фиксация, что деньги пришли в казну.
+    //    После этой точки любая неудача сделки → заявка на ВОЗВРАТ SOL (деньги не застревают в казне).
+    const rec = await fetch(`${SB_URL}/rest/v1/market_purchases`, {
+      method: "POST",
+      headers: sbHeaders({ Prefer: "return=minimal" }),
+      body: JSON.stringify({ signature, buyer: wallet, kind: type, ref_id: refId, seller: "", lamports: paid, created_at: new Date().toISOString() }),
+    });
+    if (rec.status === 409) return jsonResp({ error: "already processed" }, 409);
+    if (!rec.ok) return jsonResp({ error: "record failed" }, 500);
+
+    // Возврат: заявка на выплату всей уплаченной суммы обратно покупателю (админ подтвердит в панели).
+    const refund = async (reason: string) => {
+      await fetch(`${SB_URL}/rest/v1/sell_requests`, {
+        method: "POST",
+        headers: sbHeaders({ Prefer: "return=minimal" }),
+        body: JSON.stringify({ id: `r${Date.now()}${Math.random().toString(36).slice(2, 6)}`, wallet, pv: 0, sol: +(paid / 1e9).toFixed(4), kind: "refund", status: "pending", created_at: new Date().toISOString() }),
+      });
+      return jsonResp({ error: `${reason} — refund queued`, refund: true }, 409);
+    };
+
+    // 3) Находим лот/эксклюзив и его цену.
     let priceSol: number;
     let seller = "";
     let species: string;
@@ -85,7 +105,7 @@ Deno.serve(async (req) => {
     if (type === "sale") {
       const rows = await fetch(`${SB_URL}/rest/v1/listings?id=eq.${encodeURIComponent(refId)}&kind=eq.sale&select=*`, { headers: sbHeaders() }).then((r) => r.json());
       const lot = rows?.[0];
-      if (!lot) return jsonResp({ error: "listing gone (already sold?)" }, 404);
+      if (!lot) return refund("listing gone");
       priceSol = Number(lot.price);
       seller = lot.seller;
       species = lot.species;
@@ -95,37 +115,26 @@ Deno.serve(async (req) => {
     } else {
       const rows = await fetch(`${SB_URL}/rest/v1/exclusives?id=eq.${encodeURIComponent(refId)}&select=*`, { headers: sbHeaders() }).then((r) => r.json());
       const ex = rows?.[0];
-      if (!ex || !ex.active || (ex.stock ?? 0) <= 0) return jsonResp({ error: "exclusive sold out" }, 404);
+      if (!ex || !ex.active || (ex.stock ?? 0) <= 0) return refund("exclusive sold out");
       priceSol = Number(ex.price);
       species = ex.species;
       name = ex.name || undefined;
     }
-    const priceLamports = Math.round(priceSol * 1e9);
-    if (paid < priceLamports) return jsonResp({ error: "underpaid" }, 400);
-
-    // 3) Замок от повторной обработки ЭТОЙ ЖЕ tx (signature — PK): повтор → 409, сделку не проводим дважды.
-    const rec = await fetch(`${SB_URL}/rest/v1/market_purchases`, {
-      method: "POST",
-      headers: sbHeaders({ Prefer: "return=minimal" }),
-      body: JSON.stringify({ signature, buyer: wallet, kind: type, ref_id: refId, seller, lamports: paid, created_at: new Date().toISOString() }),
-    });
-    if (rec.status === 409) return jsonResp({ error: "already processed" }, 409);
-    if (!rec.ok) return jsonResp({ error: "record failed" }, 500);
+    if (paid < Math.round(priceSol * 1e9)) return refund("underpaid");
 
     // 4) Проверяем покупателя: сейв есть и он ещё не владеет этим видом (иначе дубль — блокируем ДО клейма).
     const buyer = await loadSave(wallet);
-    if (!buyer) return jsonResp({ error: "no save yet — play a bit first" }, 400);
-    if ((buyer.ownedSpecies ?? []).includes(species)) return jsonResp({ error: "you already own this pet" }, 400);
+    if (!buyer) return refund("no save");
+    if ((buyer.ownedSpecies ?? []).includes(species)) return refund("you already own this pet");
 
     // 5) АТОМАРНО «забираем» товар, чтобы два одновременных покупателя (две разные tx) не получили
     //    одного пета: продажу — условным DELETE лота; эксклюзив — атомарным decrement через RPC.
-    //    Кто не успел — 409 (его SOL остаётся в казне, разбираем вручную — редкая гонка).
     if (type === "sale") {
       const claimed = await fetch(`${SB_URL}/rest/v1/listings?id=eq.${encodeURIComponent(refId)}&kind=eq.sale`, {
         method: "DELETE",
         headers: sbHeaders({ Prefer: "return=representation" }),
       }).then((r) => r.json()).catch(() => []);
-      if (!Array.isArray(claimed) || claimed.length === 0) return jsonResp({ error: "listing already sold" }, 409);
+      if (!Array.isArray(claimed) || claimed.length === 0) return refund("listing already sold");
       const lot = claimed[0]; // авторитетные данные лота на момент захвата
       species = lot.species;
       level = lot.level ?? 1;
@@ -139,21 +148,25 @@ Deno.serve(async (req) => {
         headers: sbHeaders(),
         body: JSON.stringify({ p_id: refId }),
       }).then((r) => r.json()).catch(() => []);
-      if (!Array.isArray(claimed) || claimed.length === 0) return jsonResp({ error: "exclusive sold out" }, 409);
+      if (!Array.isArray(claimed) || claimed.length === 0) return refund("exclusive sold out");
     }
 
     // 6) Выдаём пета покупателю (владение уже проверено на шаге 4).
     grantPet(buyer, species, level, buffs, name);
     await writeSave(wallet, buyer);
 
-    // 7) Продажа между игроками → заявка продавцу на выплату (минус комиссия казны).
+    // 7) Продажа между игроками → заявка продавцу на выплату (минус комиссия казны). Ретрай при сбое
+    //    (id — PK, поэтому повторная удачная вставка = 409, считаем успехом → без двойной выплаты).
     if (type === "sale") {
       const payout = +((priceSol * (10000 - FEE_BPS)) / 10000).toFixed(4);
-      await fetch(`${SB_URL}/rest/v1/sell_requests`, {
-        method: "POST",
-        headers: sbHeaders({ Prefer: "return=minimal" }),
-        body: JSON.stringify({ id: `m${Date.now()}${Math.random().toString(36).slice(2, 6)}`, wallet: seller, pv: 0, sol: payout, kind: "market", status: "pending", created_at: new Date().toISOString() }),
-      });
+      const body = JSON.stringify({ id: `m${Date.now()}${Math.random().toString(36).slice(2, 6)}`, wallet: seller, pv: 0, sol: payout, kind: "market", status: "pending", created_at: new Date().toISOString() });
+      let ok = false;
+      for (let i = 0; i < 3 && !ok; i++) {
+        const r = await fetch(`${SB_URL}/rest/v1/sell_requests`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal" }), body });
+        ok = r.ok || r.status === 409;
+        if (!ok) await new Promise((res) => setTimeout(res, 500));
+      }
+      if (!ok) console.error("payout row insert failed for seller", seller, "sig", signature);
     }
 
     return jsonResp({ ok: true, save: buyer });

@@ -66,6 +66,15 @@ Deno.serve(async (req) => {
     const rows = await fetch(`${SB_URL}/rest/v1/sell_requests?id=eq.${encodeURIComponent(id)}&select=*`, { headers: sbHeaders() }).then((r) => r.json());
     const reqRow = rows?.[0];
     if (!reqRow) return jsonResp({ error: "not found" }, 404);
+
+    // reset → вернуть ЗАСТРЯВШУЮ заявку (error/paying) обратно в очередь, чтобы повторить выплату.
+    // Только для не-терминальных статусов; paid/rejected не трогаем.
+    if (action === "reset") {
+      if (reqRow.status !== "error" && reqRow.status !== "paying") return jsonResp({ error: "not stuck" }, 409);
+      await fetch(`${SB_URL}/rest/v1/sell_requests?id=eq.${encodeURIComponent(id)}`, { method: "PATCH", headers: sbHeaders({ Prefer: "return=minimal" }), body: JSON.stringify({ status: "pending" }) });
+      return jsonResp({ ok: true, status: "pending" });
+    }
+
     if (reqRow.status !== "pending") return jsonResp({ error: "already handled" }, 409);
 
     // АТОМАРНЫЙ ЗАХВАТ: переводим pending → paying/rejecting условным UPDATE (WHERE status=pending).
@@ -80,8 +89,8 @@ Deno.serve(async (req) => {
     if (!Array.isArray(claimed) || claimed.length === 0) return jsonResp({ error: "already handled" }, 409);
 
     if (action === "reject") {
-      // market-заявки (продажа пета) не возвращают PV: пет уже у покупателя, возвращать нечего.
-      const sRows = reqRow.kind === "market"
+      // Возвращаем PV только для ЧИСТОЙ продажи PV (kind='sell'). market/refund PV не держат — не возвращаем.
+      const sRows = reqRow.kind !== "sell"
         ? []
         : await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(reqRow.wallet)}&select=data`, { headers: sbHeaders() }).then((r) => r.json());
       const data = sRows?.[0]?.data;

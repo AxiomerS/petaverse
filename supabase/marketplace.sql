@@ -61,3 +61,35 @@ as $$
    where id = p_id and active = true and stock > 0
   returning *;
 $$;
+
+-- 5) Заявки на награды за квесты. Игрок создаёт свою заявку (wallet=свой), админ видит все и
+--    отмечает paid (SOL отправляет вручную). unique(wallet, quest_id) → один квест нельзя забрать дважды.
+create table if not exists public.quest_claims (
+  id         text primary key,
+  wallet     text not null,
+  quest_id   text not null,
+  status     text not null default 'pending',
+  created_at timestamptz not null default now(),
+  unique (wallet, quest_id)
+);
+alter table public.quest_claims enable row level security;
+
+-- читать: свои — игрок, все — админ
+drop policy if exists quest_claims_read on public.quest_claims;
+create policy quest_claims_read on public.quest_claims
+  for select to authenticated
+  using ((auth.jwt() ->> 'wallet') = wallet
+      or (auth.jwt() ->> 'wallet') = 'EezTHmjK2x4zYDSSjRwQadrgVsfapMUu9HtBMFXyTrPk');
+
+-- создавать: только свою заявку (wallet = свой claim в JWT)
+drop policy if exists quest_claims_insert on public.quest_claims;
+create policy quest_claims_insert on public.quest_claims
+  for insert to authenticated
+  with check ((auth.jwt() ->> 'wallet') = wallet);
+
+-- менять статус (mark paid): только админ
+drop policy if exists quest_claims_admin_update on public.quest_claims;
+create policy quest_claims_admin_update on public.quest_claims
+  for update to authenticated
+  using ((auth.jwt() ->> 'wallet') = 'EezTHmjK2x4zYDSSjRwQadrgVsfapMUu9HtBMFXyTrPk')
+  with check ((auth.jwt() ->> 'wallet') = 'EezTHmjK2x4zYDSSjRwQadrgVsfapMUu9HtBMFXyTrPk');

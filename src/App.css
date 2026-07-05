@@ -2215,6 +2215,28 @@ textarea {
 .quest-claim:hover {
   filter: brightness(1.05);
 }
+.quest-row-done {
+  opacity: 0.8;
+}
+.quest-label-done {
+  text-decoration: line-through;
+  color: var(--ink-2);
+}
+.quest-wallet {
+  align-self: flex-start;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-family: monospace;
+  font-size: 10.5px;
+  padding: 3px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.quest-wallet:hover {
+  color: var(--ink);
+  border-color: var(--accent);
+}
 
 /* ===== Market: listing form ===== */
 .list-controls {

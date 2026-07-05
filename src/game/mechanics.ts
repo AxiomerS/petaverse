@@ -60,6 +60,11 @@ export function silRate(accessories: string[], speciesId: string): number {
   return (base + mythicAcc(accessories).silFlat) * (1 + speciesEffect(speciesId).sil);
 }
 
+// Множитель дохода PV/min от уровня питомца: L1 = ×1.0, L2 = ×1.1, L3 = ×1.2, … (+10% за уровень).
+export function levelSilMult(level: number): number {
+  return 1 + (level - 1) * 0.1;
+}
+
 // Награды и стартовый баланс.
 export const DAILY_REWARD = 50;
 export const DAILY_COOLDOWN = 2 * 3_600_000; // награду можно забирать раз в 2 часа

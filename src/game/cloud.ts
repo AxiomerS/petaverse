@@ -70,8 +70,21 @@ export async function fetchSellRequests(status = "pending"): Promise<SellRequest
   }
 }
 
-// Подтвердить (approve → выплата SOL с казны) или отклонить (reject → возврат PV) заявку. Только админ.
-export async function payoutSell(id: string, action: "approve" | "reject"): Promise<{ ok: true; status: string; sig?: string } | { error: string }> {
+// Застрявшие заявки (сбой выплаты: status error/paying) — для админа, чтобы разобрать/повторить.
+export async function fetchStuckSellRequests(): Promise<SellRequest[] | null> {
+  if (!isCloudEnabled()) return null;
+  try {
+    const res = await fetch(`${URL}/rest/v1/sell_requests?status=in.(error,paying)&select=*&order=created_at.asc`, { headers: headers() });
+    if (!res.ok) return null;
+    return (await res.json()) as SellRequest[];
+  } catch {
+    return null;
+  }
+}
+
+// Подтвердить (approve → выплата SOL с казны), отклонить (reject → возврат PV для kind='sell') или
+// вернуть застрявшую заявку в очередь (reset → error/paying обратно в pending). Только админ.
+export async function payoutSell(id: string, action: "approve" | "reject" | "reset"): Promise<{ ok: true; status: string; sig?: string } | { error: string }> {
   if (!isCloudEnabled()) return { error: "cloud off" };
   try {
     const res = await fetch(`${URL}/functions/v1/sell-payout`, { method: "POST", headers: headers(), body: JSON.stringify({ id, action }) });
@@ -332,6 +345,52 @@ export async function deleteExclusive(id: string): Promise<boolean> {
   if (!isCloudEnabled()) return false;
   try {
     const res = await fetch(`${URL}/rest/v1/exclusives?id=eq.${encodeURIComponent(id)}`, { method: "DELETE", headers: headers() });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ===== Заявки на награды за квесты (таблица public.quest_claims) — выплата SOL вручную админом =====
+// Сумму НЕ храним в строке (клиенту не доверяем) — админ берёт её из QUESTS по quest_id.
+export type QuestClaim = { id: string; wallet: string; quest_id: string; status: string; created_at?: string };
+
+// Игрок запрашивает награду за выполненный квест. true = заявка создана ИЛИ уже существовала (409).
+export async function createQuestClaim(wallet: string, questId: string): Promise<boolean> {
+  if (!isCloudEnabled()) return false;
+  try {
+    const res = await fetch(`${URL}/rest/v1/quest_claims`, {
+      method: "POST",
+      headers: headers({ Prefer: "return=minimal" }),
+      body: JSON.stringify({ id: `q${Date.now()}${Math.random().toString(36).slice(2, 6)}`, wallet, quest_id: questId, status: "pending", created_at: new Date().toISOString() }),
+    });
+    return res.ok || res.status === 409; // 409 = уже заявлял этот квест → считаем забранным
+  } catch {
+    return false;
+  }
+}
+
+// Все заявки на награды по статусу (админ видит все — по RLS-политике). null — облако выключено/ошибка.
+export async function fetchQuestClaims(status = "pending"): Promise<QuestClaim[] | null> {
+  if (!isCloudEnabled()) return null;
+  try {
+    const res = await fetch(`${URL}/rest/v1/quest_claims?status=eq.${status}&select=*&order=created_at.asc`, { headers: headers() });
+    if (!res.ok) return null;
+    return (await res.json()) as QuestClaim[];
+  } catch {
+    return null;
+  }
+}
+
+// Отметить заявку выплаченной (только админ). SOL админ отправляет вручную из своего кошелька.
+export async function markQuestClaimPaid(id: string): Promise<boolean> {
+  if (!isCloudEnabled()) return false;
+  try {
+    const res = await fetch(`${URL}/rest/v1/quest_claims?id=eq.${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: headers({ Prefer: "return=minimal" }),
+      body: JSON.stringify({ status: "paid" }),
+    });
     return res.ok;
   } catch {
     return false;
