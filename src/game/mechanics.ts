@@ -63,6 +63,6 @@ export function silRate(accessories: string[], speciesId: string): number {
 // Награды и стартовый баланс.
 export const DAILY_REWARD = 50;
 export const DAILY_COOLDOWN = 2 * 3_600_000; // награду можно забирать раз в 2 часа
-export const START_COINS = 10000;
+export const START_COINS = 50;
 // Версия разовой выдачи монет: повышай, чтобы один раз пополнить существующие сейвы до START_COINS.
 export const GRANT_V = 1;

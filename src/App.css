@@ -371,6 +371,46 @@ textarea {
   color: #2be08a;
   padding: 4px 0;
 }
+
+/* ---------- admin: sell requests ---------- */
+.admin-req {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.admin-req-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.admin-req-amt {
+  font-weight: 800;
+  color: var(--accent-ink);
+  font-size: 14px;
+}
+.admin-req-who {
+  font-size: 11px;
+  color: var(--ink-2);
+  font-family: monospace;
+}
+.admin-req-btns {
+  display: flex;
+  gap: 6px;
+}
+.admin-ok {
+  padding: 8px 14px;
+  height: auto;
+}
+.admin-no {
+  padding: 8px 12px;
+  height: auto;
+  color: #ff8a8a;
+}
 .buy-sil-btn {
   align-self: center;
   width: 32px;
@@ -2199,6 +2239,11 @@ textarea {
   color: var(--ink-2);
   font-family: monospace;
   margin-top: 2px;
+}
+.market-buy {
+  margin-top: 4px;
+  padding: 4px 10px;
+  font-size: 11px;
 }
 .mini-x {
   position: absolute;

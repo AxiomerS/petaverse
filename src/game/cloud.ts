@@ -23,6 +23,66 @@ function headers(extra?: Record<string, string>): Record<string, string> {
   return { apikey: KEY!, Authorization: `Bearer ${sessionToken ?? KEY!}`, "Content-Type": "application/json", ...extra };
 }
 
+// Подтвердить покупку: серверная функция проверит транзакцию в блокчейне и начислит PV.
+// Возвращает новый баланс coins или null.
+export async function confirmPurchase(wallet: string, signature: string): Promise<{ coins: number; credited: number } | { error: string }> {
+  if (!isCloudEnabled()) return { error: "cloud off" };
+  try {
+    const res = await fetch(`${URL}/functions/v1/buy`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ wallet, signature }),
+    });
+    const data = (await res.json().catch(() => ({}))) as { coins?: number; credited?: number; error?: string };
+    if (res.ok && typeof data.coins === "number") return { coins: data.coins, credited: data.credited ?? 0 };
+    return { error: data.error ?? `HTTP ${res.status}` };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+// Запрос на продажу PV → SOL: сервер списывает PV и создаёт заявку (pending). Выплата — после
+// ручного подтверждения. Возвращает новый баланс coins и сумму SOL, либо ошибку.
+export async function requestSell(pv: number): Promise<{ coins: number; sol: number } | { error: string }> {
+  if (!isCloudEnabled()) return { error: "cloud off" };
+  try {
+    const res = await fetch(`${URL}/functions/v1/sell`, { method: "POST", headers: headers(), body: JSON.stringify({ pv }) });
+    const data = (await res.json().catch(() => ({}))) as { coins?: number; sol?: number; error?: string };
+    if (res.ok && typeof data.coins === "number") return { coins: data.coins, sol: data.sol ?? 0 };
+    return { error: data.error ?? `HTTP ${res.status}` };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+// Заявка на продажу (для админ-панели).
+export type SellRequest = { id: string; wallet: string; pv: number; sol: number; status: string; sig?: string; kind?: string; created_at?: string };
+
+// Список заявок по статусу (видит свои — обычный игрок; все — админ, по RLS-политике).
+export async function fetchSellRequests(status = "pending"): Promise<SellRequest[] | null> {
+  if (!isCloudEnabled()) return null;
+  try {
+    const res = await fetch(`${URL}/rest/v1/sell_requests?status=eq.${status}&select=*&order=created_at.asc`, { headers: headers() });
+    if (!res.ok) return null;
+    return (await res.json()) as SellRequest[];
+  } catch {
+    return null;
+  }
+}
+
+// Подтвердить (approve → выплата SOL с казны) или отклонить (reject → возврат PV) заявку. Только админ.
+export async function payoutSell(id: string, action: "approve" | "reject"): Promise<{ ok: true; status: string; sig?: string } | { error: string }> {
+  if (!isCloudEnabled()) return { error: "cloud off" };
+  try {
+    const res = await fetch(`${URL}/functions/v1/sell-payout`, { method: "POST", headers: headers(), body: JSON.stringify({ id, action }) });
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; status?: string; sig?: string; error?: string };
+    if (res.ok && data.ok) return { ok: true, status: data.status ?? "", sig: data.sig };
+    return { error: data.error ?? `HTTP ${res.status}` };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
 // Верификация кошелька: шлём подпись в Edge Function, получаем JWT. Возвращает токен или null.
 export async function signIn(wallet: string, message: string, signatureHex: string): Promise<string | null> {
   if (!isCloudEnabled()) return null;
@@ -203,13 +263,75 @@ export async function createListing(l: Listing): Promise<boolean> {
 }
 
 // Снять свой лот (только свой — по id и адресу продавца).
-export async function deleteListing(id: string, seller: string): Promise<boolean> {
-  if (!isCloudEnabled()) return false;
+// Возвращает удалённые строки: пустой массив = лот уже продан/снят (нечего возвращать), null = ошибка.
+export async function deleteListing(id: string, seller: string): Promise<Listing[] | null> {
+  if (!isCloudEnabled()) return null;
   try {
     const res = await fetch(`${URL}/rest/v1/listings?id=eq.${encodeURIComponent(id)}&seller=eq.${encodeURIComponent(seller)}`, {
       method: "DELETE",
-      headers: headers(),
+      headers: headers({ Prefer: "return=representation" }),
     });
+    if (!res.ok) return null;
+    return (await res.json().catch(() => [])) as Listing[];
+  } catch {
+    return null;
+  }
+}
+
+// ===== Покупка на маркете (реальный SOL) — серверная функция проверяет tx и проводит сделку =====
+// type 'sale' — купить лот игрока (refId = listing.id); 'exclusive' — купить эксклюзив (refId = exclusive.id).
+// Возвращает обновлённый сейв покупателя (для setPet) или ошибку.
+export async function confirmMarketBuy(type: "sale" | "exclusive", refId: string, signature: string, wallet: string): Promise<{ save: SavedPet } | { error: string }> {
+  if (!isCloudEnabled()) return { error: "cloud off" };
+  try {
+    const res = await fetch(`${URL}/functions/v1/market-buy`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ wallet, signature, type, refId }),
+    });
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; save?: SavedPet; error?: string };
+    if (res.ok && data.ok && data.save) return { save: data.save };
+    return { error: data.error ?? `HTTP ${res.status}` };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+// ===== Эксклюзивные лоты (таблица public.exclusives) — продаёт казна лимитированным тиражом =====
+export type Exclusive = { id: string; species: string; name?: string; price: number; stock: number; sold?: number; active?: boolean; created_at?: string };
+
+// Активные эксклюзивы, новые сверху. null — облако выключено/ошибка.
+export async function fetchExclusives(limit = 50): Promise<Exclusive[] | null> {
+  if (!isCloudEnabled()) return null;
+  try {
+    const res = await fetch(`${URL}/rest/v1/exclusives?active=eq.true&select=*&order=created_at.desc&limit=${limit}`, { headers: headers() });
+    if (!res.ok) return null;
+    return (await res.json()) as Exclusive[];
+  } catch {
+    return null;
+  }
+}
+
+// Добавить эксклюзив (только админ — RLS пропустит запись лишь для админского wallet-claim в JWT).
+export async function createExclusive(e: Exclusive): Promise<boolean> {
+  if (!isCloudEnabled()) return false;
+  try {
+    const res = await fetch(`${URL}/rest/v1/exclusives`, {
+      method: "POST",
+      headers: headers({ Prefer: "return=minimal" }),
+      body: JSON.stringify({ ...e, created_at: new Date().toISOString() }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Убрать эксклюзив с витрины (только админ).
+export async function deleteExclusive(id: string): Promise<boolean> {
+  if (!isCloudEnabled()) return false;
+  try {
+    const res = await fetch(`${URL}/rest/v1/exclusives?id=eq.${encodeURIComponent(id)}`, { method: "DELETE", headers: headers() });
     return res.ok;
   } catch {
     return false;

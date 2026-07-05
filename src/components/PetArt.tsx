@@ -103,6 +103,8 @@ const PET_SVG: Record<string, ReactNode> = {
 const PET_IMG: Record<string, string> = {
   hamster: "/hamster.png",
   cat: "/cat.png",
+  dog: "/dog.png",
+  rabbit: "/rabbit.png",
 };
 
 // Показать питомца: своя картинка → кастомный SVG → эмодзи (фолбэк).

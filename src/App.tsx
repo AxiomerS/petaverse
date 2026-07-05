@@ -12,7 +12,8 @@ import { POTIONS, potionById, potionEffects, potionTitle, type Potion } from "./
 import { QUESTS } from "./game/quests";
 import { type SavedPet, STORAGE_KEY, loadPet, type MarketListing } from "./game/save";
 import { getPhantom, shortAddress, signMessageHex, PHANTOM_INSTALL_URL } from "./game/wallet";
-import { isCloudEnabled, loadCloudSave, saveCloudSave, submitScore, fetchTopScores, submitArena, fetchTopArena, upsertPvpProfile, findPvpOpponent, fetchListings, createListing, deleteListing, signIn, setSessionToken, type ScoreRow, type ArenaRow, type Listing } from "./game/cloud";
+import { isCloudEnabled, loadCloudSave, saveCloudSave, submitScore, fetchTopScores, submitArena, fetchTopArena, upsertPvpProfile, findPvpOpponent, fetchListings, createListing, deleteListing, confirmMarketBuy, fetchExclusives, createExclusive, deleteExclusive, signIn, setSessionToken, confirmPurchase, requestSell, fetchSellRequests, payoutSell, type ScoreRow, type ArenaRow, type Listing, type Exclusive, type SellRequest } from "./game/cloud";
+import { sendSolPayment, SOL_PV_RATE, SOL_BUY_PACKS, SOL_SELL_RATE, SOL_SELL_PACKS, SOL_MARKET_FEE_BPS } from "./game/pay";
 import { SPIN_MS, playSpinSound, playWinSound } from "./game/audio";
 import { Coin, StatBar } from "./components/ui";
 import { PetArt } from "./components/PetArt";
@@ -47,23 +48,18 @@ function runRewardForRank(rank: number): number {
   return 50; // ниже топ-10 (если счёт совсем мал) — небольшой утешительный приз
 }
 
-type Modal = null | "shop" | "inventory" | "accessories" | "pets" | "leaderboard" | "roulette" | "play" | "breed" | "buysil" | "market" | "playmenu" | "pumpfun" | "battle" | "potions";
+type Modal = null | "shop" | "inventory" | "accessories" | "pets" | "leaderboard" | "roulette" | "play" | "breed" | "buysil" | "market" | "playmenu" | "pumpfun" | "battle" | "potions" | "admin";
+
+// Кошелёк-админ: только он видит и подтверждает заявки на продажу PV.
+const ADMIN_WALLET = "EezTHmjK2x4zYDSSjRwQadrgVsfapMUu9HtBMFXyTrPk";
 
 // Внешние ссылки проекта (TODO: заменить на финальные).
-const LINK_GITHUB = "https://github.com/";
-const LINK_TWITTER = "https://x.com/";
+const LINK_GITHUB = "https://github.com/AxiomerS/petaverse";
+const LINK_TWITTER = "https://x.com/PetaVerseSol";
 const LINK_PUMPFUN = "https://pump.fun/";
 const TOKEN_CA = ""; // адрес контракта токена; пусто = ещё не запущен
 
-// Обмен Sil ↔ SOL (локальный, пока нет настоящего кошелька Phantom).
-// Покупка Sil выгоднее продажи: за 1 SOL дают BUY_RATE Sil, а чтобы получить 1 SOL обратно,
-// нужно SELL_RATE Sil (SELL_RATE > BUY_RATE) — то есть обмен Sil→SOL немного дороже обратного.
-const SOL_BUY_RATE = 50000; // 1 SOL → 50 000 Sil (покупка Sil)
-const SOL_SELL_RATE = 62500; // 62 500 Sil → 1 SOL (продажа Sil, ~+25% спред)
-// Варианты покупки Sil (тратим SOL).
-const SOL_BUY_PACKS = [0.1, 0.5, 1, 2];
-// Варианты продажи Sil (получаем SOL).
-const SIL_SELL_PACKS = [5000, 25000, 62500, 125000];
+// Реальная покупка PV за SOL — курс и пакеты заданы в game/pay.ts (devnet).
 
 // Сессия верификации кошелька (JWT из auth-функции), хранится локально для бесшовного входа.
 const SESSION_KEY = "petaverse.session";
@@ -98,6 +94,11 @@ export default function App() {
   const [walletMenu, setWalletMenu] = useState(false); // открыт ли попап кошелька
   const [cloudLoading, setCloudLoading] = useState(false); // идёт ли загрузка облачного сейва
   const [verified, setVerified] = useState(false); // подтверждён ли кошелёк подписью
+  const [buying, setBuying] = useState(false); // идёт ли покупка PV за SOL
+  const [adminReqs, setAdminReqs] = useState<SellRequest[] | null>(null); // pending-заявки на продажу (для админа)
+  const [payoutBusy, setPayoutBusy] = useState(false); // идёт обработка выплаты (блок от двойного клика Approve/Reject)
+  const [listBusy, setListBusy] = useState(false); // идёт выставление лота (блок от двойного клика List)
+  const isAdmin = wallet === ADMIN_WALLET;
   const [topScores, setTopScores] = useState<ScoreRow[] | null>(null); // глобальный топ лидерборда
   const [lbLoaded, setLbLoaded] = useState(false); // загрузили ли топ (чтобы отличить загрузку от «пусто»)
   const [arenaTop, setArenaTop] = useState<ArenaRow[] | null>(null); // глобальный топ арены
@@ -105,7 +106,12 @@ export default function App() {
   const [marketLoaded, setMarketLoaded] = useState(false); // загрузили ли лоты
   const [marketTab, setMarketTab] = useState<"exclusive" | "player" | "auction">("exclusive");
   const [listSpecies, setListSpecies] = useState<string>(""); // выбранный питомец для листинга
-  const [listPrice, setListPrice] = useState<string>(""); // цена/старт-ставка (SOL) для листинга
+  const [listPrice, setListPrice] = useState<string>(""); // цена (SOL) для листинга
+  const [exclusives, setExclusives] = useState<Exclusive[] | null>(null); // эксклюзивы от казны
+  const [exLoaded, setExLoaded] = useState(false); // загрузили ли эксклюзивы
+  const [exSpecies, setExSpecies] = useState<string>(""); // админ-форма: вид эксклюзива
+  const [exPrice, setExPrice] = useState<string>(""); // админ-форма: цена SOL
+  const [exStock, setExStock] = useState<string>("1"); // админ-форма: тираж
   const [toast, setToast] = useState("");
   // Chest opening: a roulette strip of emojis that scrolls and lands on the won one.
   // Display-only — the won item is already added to inventory/owned when the chest opens.
@@ -245,18 +251,34 @@ export default function App() {
     return () => { cancelled = true; };
   }, [modal]);
 
-  // Рынок: подгружаем общие лоты при открытии рынка и смене вкладки (продажа/аукцион).
+  // Админ: подгружаем pending-заявки на продажу при открытии админ-панели.
+  useEffect(() => {
+    if (modal !== "admin" || !isAdmin) return;
+    let cancelled = false;
+    setAdminReqs(null);
+    fetchSellRequests("pending").then((rows) => { if (!cancelled) setAdminReqs(rows ?? []); });
+    return () => { cancelled = true; };
+  }, [modal, isAdmin]);
+
+  // Рынок: подгружаем лоты игроков (вкладка Player) или эксклюзивы (вкладка Exclusive).
   useEffect(() => {
     if (modal !== "market" || !isCloudEnabled()) return;
-    if (marketTab !== "player" && marketTab !== "auction") return;
     let cancelled = false;
-    setMarketLoaded(false);
-    const kind = marketTab === "player" ? "sale" : "auction";
-    fetchListings(kind).then((rows) => {
-      if (cancelled) return;
-      setMarketListings(rows);
-      setMarketLoaded(true);
-    });
+    if (marketTab === "player") {
+      setMarketLoaded(false);
+      fetchListings("sale").then((rows) => {
+        if (cancelled) return;
+        setMarketListings(rows);
+        setMarketLoaded(true);
+      });
+    } else if (marketTab === "exclusive") {
+      setExLoaded(false);
+      fetchExclusives().then((rows) => {
+        if (cancelled) return;
+        setExclusives(rows);
+        setExLoaded(true);
+      });
+    }
     return () => { cancelled = true; };
   }, [modal, marketTab]);
 
@@ -567,25 +589,56 @@ export default function App() {
     }
   }
 
-  // Обмен SOL → Sil (покупка Sil): тратим SOL, получаем SOL_BUY_RATE Sil за каждый SOL.
-  function buySilWithSol(solAmount: number) {
-    setPet((prev) => {
-      if (!prev) return prev;
-      if (prev.sol < solAmount) { setToast("Not enough SOL"); return prev; }
-      const gained = Math.round(solAmount * SOL_BUY_RATE);
-      setToast(`Bought ${gained.toLocaleString()} ${SIL} for ◎${solAmount}`);
-      return { ...prev, sol: +(prev.sol - solAmount).toFixed(4), coins: prev.coins + gained, updatedAt: Date.now() };
-    });
+  // Реальная покупка PV за SOL: Phantom отправляет SOL на treasury → сервер проверяет и начисляет PV.
+  async function buyPvReal(sol: number) {
+    if (!wallet) return setToast("Connect wallet first");
+    setBuying(true);
+    setToast("Confirm the payment in Phantom…");
+    try {
+      const sig = await sendSolPayment(sol);
+      if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
+      setToast("Verifying payment on-chain…");
+      const res = await confirmPurchase(wallet, sig);
+      if ("coins" in res) {
+        setPet((p) => (p ? { ...p, coins: res.coins, updatedAt: Date.now() } : p));
+        setToast(`✅ +${res.credited.toLocaleString()} ${SIL} added!`);
+      } else {
+        setToast(`Paid, but crediting failed: ${res.error}`);
+      }
+    } catch {
+      setToast("Purchase failed");
+    }
+    setBuying(false);
   }
-  // Обмен Sil → SOL (продажа Sil): тратим Sil, получаем SOL по курсу SOL_SELL_RATE (дороже покупки).
-  function sellSilForSol(silAmount: number) {
-    setPet((prev) => {
-      if (!prev) return prev;
-      if (prev.coins < silAmount) { setToast(`Not enough ${SIL}`); return prev; }
-      const gained = +(silAmount / SOL_SELL_RATE).toFixed(4);
-      setToast(`Sold ${silAmount.toLocaleString()} ${SIL} for ◎${gained}`);
-      return { ...prev, coins: prev.coins - silAmount, sol: +(prev.sol + gained).toFixed(4), updatedAt: Date.now() };
-    });
+
+  // Запрос на продажу PV → SOL: сервер держит PV, выплата после ручного подтверждения.
+  async function sellPvReq(pv: number) {
+    if (!wallet) return setToast("Connect wallet first");
+    if (!pet || Math.floor(pet.coins) < pv) return setToast(`Not enough ${SIL}`);
+    setBuying(true);
+    const res = await requestSell(pv);
+    if ("coins" in res) {
+      setPet((p) => (p ? { ...p, coins: res.coins, updatedAt: Date.now() } : p));
+      setToast(`📨 Sell request: ${pv.toLocaleString()} ${SIL} → ◎${res.sol} (awaiting approval)`);
+    } else {
+      setToast(`Sell failed: ${res.error}`);
+    }
+    setBuying(false);
+  }
+
+  // Админ подтверждает (выплата SOL с казны) или отклоняет (возврат PV) заявку.
+  async function doPayout(id: string, action: "approve" | "reject") {
+    if (payoutBusy) return; // защита от двойного клика (сервер тоже атомарно защищён)
+    setPayoutBusy(true);
+    setToast(action === "approve" ? "Sending SOL from treasury…" : "Rejecting…");
+    const res = await payoutSell(id, action);
+    if ("ok" in res) {
+      setToast(action === "approve" ? `✅ Paid out${res.sig ? ` (${shortAddress(res.sig)})` : ""}` : "↩️ Rejected — PV refunded");
+      fetchSellRequests("pending").then((rows) => setAdminReqs(rows ?? []));
+    } else {
+      setToast(`Failed: ${res.error}`);
+    }
+    setPayoutBusy(false);
   }
 
   // Цена лекарства для воскрешения = база + за уровень питомца.
@@ -768,38 +821,168 @@ export default function App() {
     setPet({ ...pet, questClaimed: [...pet.questClaimed, id] });
   }
 
-  // Выставить своего питомца на рынок игроков (продажа или аукцион) с текущим уровнем и баффами.
-  async function listPet(kind: "sale" | "auction") {
+  // Выставить своего питомца на продажу. Ключевая механика: листинг = ЭСКРОУ — пета сразу
+  // изымаем из инвентаря продавца (локально + сразу в облако), его данные хранит сам лот.
+  // Так автосейв продавца не «вернёт» проданного пета. Активного пета выставлять нельзя.
+  async function listPet() {
     if (!pet) return;
     const species = listSpecies;
     const askPrice = parseFloat(listPrice);
     if (!species || !pet.ownedSpecies.includes(species)) return setToast("Pick a pet to list");
+    if (species === pet.species) return setToast("Switch to another pet before listing this one");
     if (!(askPrice > 0)) return setToast("Enter a valid SOL price");
-    const lvl = species === pet.species ? pet.level : pet.progress[species]?.level ?? 1;
-    const buffs = species === pet.species ? pet.buffs : pet.progress[species]?.buffs ?? [];
+    if (wallet && isCloudEnabled() && !verified) return setToast("Verify your wallet first (wallet menu)");
+    if (listBusy) return; // защита от двойного клика (иначе один пет уйдёт в два лота)
+    setListBusy(true);
+    const lvl = pet.progress[species]?.level ?? 1;
+    const buffs = pet.progress[species]?.buffs ?? [];
+    const name = pet.names[species] ?? "";
     const id = `l${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
     setListSpecies("");
     setListPrice("");
+    // Изымаем пета из инвентаря продавца (species остаётся в names — пригодится при возврате).
+    const progress = { ...pet.progress };
+    delete progress[species];
+    const base = { ...pet, ownedSpecies: pet.ownedSpecies.filter((s) => s !== species), progress, updatedAt: Date.now() };
     if (wallet && isCloudEnabled()) {
-      // Общий лот в Supabase — виден всем игрокам.
-      const name = species === pet.species ? pet.name : pet.names[species] ?? "";
-      await createListing({ id, seller: wallet, kind, species, level: lvl, buffs, price: askPrice, name });
-      fetchListings(kind).then(setMarketListings);
+      setPet(base);
+      saveCloudSave(wallet, base); // сразу фиксируем изъятие, чтобы автосейв не вернул пета
+      await createListing({ id, seller: wallet, kind: "sale", species, level: lvl, buffs, price: askPrice, name });
+      fetchListings("sale").then(setMarketListings);
     } else {
       // Локальный лот (без облака) — виден только тебе.
-      setPet({ ...pet, listings: [...pet.listings, { id, kind, species, level: lvl, buffs, price: askPrice, createdAt: Date.now() } as MarketListing] });
+      setPet({ ...base, listings: [...base.listings, { id, kind: "sale", species, level: lvl, buffs, price: askPrice, createdAt: Date.now() } as MarketListing] });
     }
-    setToast(kind === "sale" ? "🏷️ Pet listed for sale" : "🔨 Pet listed for auction");
+    setToast("🏷️ Pet listed for sale");
+    setListBusy(false);
   }
-  // Снять свой лот с рынка.
-  async function cancelListing(id: string, kind: "sale" | "auction") {
+
+  // Вернуть эскроу-пета продавцу (в ownedSpecies/progress/names). Имя берём из лота или из своей карты.
+  function restorePet(species: string, level: number, buffs: { kind: BuffKind; expiresAt: number }[], name?: string) {
+    if (!pet || pet.ownedSpecies.includes(species)) return;
+    const nm = name || pet.names[species];
+    const updated = {
+      ...pet,
+      ownedSpecies: [...pet.ownedSpecies, species],
+      progress: { ...pet.progress, [species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: level || 1, buffs: buffs ?? [] } },
+      names: nm ? { ...pet.names, [species]: nm } : pet.names,
+      updatedAt: Date.now(),
+    };
+    setPet(updated);
+    if (wallet && isCloudEnabled()) saveCloudSave(wallet, updated);
+  }
+
+  // Снять свой лот с продажи и вернуть пета. Если лот уже куплен — вернуть нечего.
+  async function cancelListing(id: string) {
     if (!pet) return;
     if (wallet && isCloudEnabled()) {
-      await deleteListing(id, wallet);
-      fetchListings(kind).then(setMarketListings);
+      const deleted = await deleteListing(id, wallet);
+      fetchListings("sale").then(setMarketListings);
+      if (deleted && deleted.length > 0) {
+        const lot = deleted[0];
+        restorePet(lot.species, lot.level, lot.buffs ?? [], lot.name);
+      } else if (deleted && deleted.length === 0) {
+        setToast("This pet was already sold");
+      }
     } else {
+      const lot = pet.listings.find((l) => l.id === id);
       setPet({ ...pet, listings: pet.listings.filter((l) => l.id !== id) });
+      if (lot) restorePet(lot.species, lot.level, lot.buffs ?? []);
     }
+  }
+
+  // Купить пета с рынка игроков за реальный SOL (оплата в казну → сервер проверяет tx и передаёт пета).
+  async function buyPet(listing: { id: string; species: string; price: number; seller: string }) {
+    if (!wallet) return setToast("Connect wallet first");
+    if (!verified) return setToast("Verify your wallet first (wallet menu)");
+    if (listing.seller === wallet) return setToast("That's your own listing");
+    if (pet && pet.ownedSpecies.includes(listing.species)) return setToast("You already own this pet");
+    const label = PETS.find((p) => p.id === listing.species)?.label ?? "pet";
+    setBuying(true);
+    setToast("Confirm the payment in Phantom…");
+    try {
+      const sig = await sendSolPayment(listing.price);
+      if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
+      setToast("Verifying payment on-chain…");
+      const res = await confirmMarketBuy("sale", listing.id, sig, wallet);
+      if ("save" in res) {
+        // Берём из ответа только смену владения — свой локальный прогресс (монеты и т.п.) сохраняем.
+        setPet((p) => {
+          if (!p) return res.save;
+          const merged = { ...p, ownedSpecies: res.save.ownedSpecies, progress: res.save.progress, names: res.save.names, updatedAt: Date.now() };
+          if (wallet) saveCloudSave(wallet, merged);
+          return merged;
+        });
+        setToast(`✅ Bought ${label}! It's in your collection.`);
+        fetchListings("sale").then(setMarketListings);
+      } else {
+        setToast(`Paid, but transfer failed: ${res.error}`);
+      }
+    } catch {
+      setToast("Purchase failed");
+    }
+    setBuying(false);
+  }
+
+  // Купить эксклюзивного пета у казны за реальный SOL.
+  async function buyExclusive(ex: Exclusive) {
+    if (!wallet) return setToast("Connect wallet first");
+    if (!verified) return setToast("Verify your wallet first (wallet menu)");
+    if (pet && pet.ownedSpecies.includes(ex.species)) return setToast("You already own this pet");
+    const label = PETS.find((p) => p.id === ex.species)?.label ?? "pet";
+    setBuying(true);
+    setToast("Confirm the payment in Phantom…");
+    try {
+      const sig = await sendSolPayment(ex.price);
+      if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
+      setToast("Verifying payment on-chain…");
+      const res = await confirmMarketBuy("exclusive", ex.id, sig, wallet);
+      if ("save" in res) {
+        setPet((p) => {
+          if (!p) return res.save;
+          const merged = { ...p, ownedSpecies: res.save.ownedSpecies, progress: res.save.progress, names: res.save.names, updatedAt: Date.now() };
+          if (wallet) saveCloudSave(wallet, merged);
+          return merged;
+        });
+        setToast(`✨ Bought exclusive ${label}!`);
+        fetchExclusives().then(setExclusives);
+      } else {
+        setToast(`Paid, but grant failed: ${res.error}`);
+      }
+    } catch {
+      setToast("Purchase failed");
+    }
+    setBuying(false);
+  }
+
+  // Админ: добавить эксклюзивного пета на витрину (лимитированный тираж).
+  async function addExclusive() {
+    if (!isAdmin) return;
+    if (!verified) return setToast("Verify your admin wallet first");
+    const species = exSpecies;
+    const price = parseFloat(exPrice);
+    const stock = Math.max(1, parseInt(exStock) || 1);
+    if (!species) return setToast("Pick a species");
+    if (!(price > 0)) return setToast("Enter a valid SOL price");
+    const id = `x${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+    const ok = await createExclusive({ id, species, name: "", price, stock, sold: 0, active: true });
+    if (ok) {
+      setToast("✨ Exclusive added");
+      setExSpecies("");
+      setExPrice("");
+      setExStock("1");
+      fetchExclusives().then(setExclusives);
+    } else {
+      setToast("Failed to add exclusive");
+    }
+  }
+
+  // Админ: убрать эксклюзив с витрины.
+  async function removeExclusive(id: string) {
+    if (!isAdmin) return;
+    const ok = await deleteExclusive(id);
+    if (ok) fetchExclusives().then(setExclusives);
+    else setToast("Failed to remove");
   }
 
   const pickedInfo = PETS.find((p) => p.id === picked);
@@ -907,6 +1090,9 @@ export default function App() {
                     <div className="wallet-verified">✓ Verified</div>
                   ) : (
                     <button className="wallet-menu-btn" onClick={() => verifyWallet()}>🔏 Verify wallet</button>
+                  )}
+                  {isAdmin && (
+                    <button className="wallet-menu-btn" onClick={() => { setWalletMenu(false); setModal("admin"); }}>🛠️ Sell requests</button>
                   )}
                   <button className="wallet-menu-btn" onClick={() => { navigator.clipboard?.writeText(wallet); setToast("Address copied"); setWalletMenu(false); }}>Copy address</button>
                   <button className="wallet-menu-btn wallet-disc" onClick={disconnectWallet}>Disconnect</button>
@@ -1468,46 +1654,98 @@ export default function App() {
               <h3>🛍️ Marketplace</h3>
               <span className="coins">◎ {pet.sol} SOL</span>
             </div>
-            <p className="subtitle" style={{ marginTop: -4 }}>Buy and sell pets for SOL on Solana.</p>
+            <p className="subtitle" style={{ marginTop: -4 }}>Buy and sell pets for real <b>SOL</b> — paid straight from your Phantom wallet (devnet).</p>
             <div className="market-tabs">
               <button className={"market-tab" + (marketTab === "exclusive" ? " market-tab-on" : "")} onClick={() => setMarketTab("exclusive")}>✨ Exclusive</button>
               <button className={"market-tab" + (marketTab === "player" ? " market-tab-on" : "")} onClick={() => setMarketTab("player")}>👥 Player</button>
               <button className={"market-tab" + (marketTab === "auction" ? " market-tab-on" : "")} onClick={() => setMarketTab("auction")}>🔨 Auction</button>
             </div>
 
-            {marketTab === "exclusive" && (
-              <div className="market-empty">
-                <div className="market-empty-emoji">✨</div>
-                <p className="empty">Exclusive pets &amp; items you can't get from regular chests — sold for <b>SOL</b> by Petaverse. Coming soon.</p>
-              </div>
-            )}
+            {marketTab === "exclusive" && (() => {
+              const cloud = isCloudEnabled();
+              const loading = cloud && !exLoaded;
+              const rows = exclusives ?? [];
+              return (
+                <>
+                  {isAdmin && (
+                    <>
+                      <div className="section-label">Add an exclusive (admin)</div>
+                      <p className="subtitle" style={{ marginTop: -4 }}>Drop a limited pet the community can only buy here, for SOL.</p>
+                      <div className="list-controls">
+                        <select className="name-input list-select" value={exSpecies} onChange={(e) => setExSpecies(e.target.value)}>
+                          <option value="">Choose a species…</option>
+                          {PETS.map((p) => <option key={p.id} value={p.id}>{p.label} · {RARITY[p.rarity].label}</option>)}
+                        </select>
+                        <input className="name-input list-price" type="number" min="0" step="0.01" placeholder="Price ◎" value={exPrice} onChange={(e) => setExPrice(e.target.value)} />
+                        <input className="name-input list-price" type="number" min="1" step="1" placeholder="Qty" value={exStock} onChange={(e) => setExStock(e.target.value)} />
+                        <button className="btn btn-primary" onClick={addExclusive}>✨ Add</button>
+                      </div>
+                    </>
+                  )}
 
-            {(marketTab === "player" || marketTab === "auction") && (() => {
-              const kind: "sale" | "auction" = marketTab === "player" ? "sale" : "auction";
+                  <div className="section-label">Exclusive pets</div>
+                  <p className="subtitle" style={{ marginTop: -4 }}>Limited pets sold for <b>SOL</b> by Petaverse — grab them before they're gone.</p>
+                  {loading ? (
+                    <p className="empty">Loading exclusives… ⏳</p>
+                  ) : rows.length === 0 ? (
+                    <p className="empty">No exclusives right now — check back soon. ✨</p>
+                  ) : (
+                    <div className="inv-grid">
+                      {rows.map((ex) => {
+                        const info = PETS.find((p) => p.id === ex.species)!;
+                        const owned = !!pet && pet.ownedSpecies.includes(ex.species);
+                        const soldOut = (ex.stock ?? 0) <= 0;
+                        return (
+                          <div key={ex.id} className="inv-item inv-item-tall market-listing">
+                            {isAdmin && <button className="mini-x" onClick={() => removeExclusive(ex.id)} title="Remove exclusive">✕</button>}
+                            <span className="rar-dot" style={{ background: RARITY[info.rarity].color }} />
+                            <span className="inv-emoji"><PetArt species={ex.species} size={34} /></span>
+                            <span className="inv-name">{ex.name || info.label}</span>
+                            <span className="inv-perk">{soldOut ? "sold out" : `${ex.stock} left`}</span>
+                            <span className="inv-feed">◎ {ex.price}</span>
+                            {cloud && (
+                              <button className="btn btn-primary market-buy" disabled={buying || soldOut || owned} onClick={() => buyExclusive(ex)}>
+                                {owned ? "Owned" : soldOut ? "Sold out" : "Buy"}
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {cloud && !wallet && <p className="empty" style={{ marginTop: 8 }}>🔌 Connect your wallet to buy exclusives.</p>}
+                </>
+              );
+            })()}
+
+            {marketTab === "player" && (() => {
               const cloud = isCloudEnabled();
               const loading = cloud && !marketLoaded;
               type Row = { id: string; species: string; level: number; price: number; buffs: { kind: BuffKind; expiresAt: number }[]; seller: string; mine: boolean };
               // Общие лоты из Supabase (видны всем) или локальные (без облака — только свои).
               const listings: Row[] = cloud
                 ? (marketListings ?? []).map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs ?? [], seller: l.seller, mine: !!wallet && l.seller === wallet }))
-                : pet.listings.filter((l) => l.kind === kind).map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs, seller: "you", mine: true }));
+                : pet.listings.filter((l) => l.kind === "sale").map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs, seller: "you", mine: true }));
+              // Питомцев для листинга можно выставить только НЕактивных (активного продавать нельзя).
+              const listable = pet.ownedSpecies.filter((id) => id !== pet.species);
+              const netPct = (10000 - SOL_MARKET_FEE_BPS) / 100;
               return (
                 <>
-                  <div className="section-label">{kind === "sale" ? "Sell a pet" : "Auction a pet"}</div>
+                  <div className="section-label">Sell a pet</div>
                   <p className="subtitle" style={{ marginTop: -4 }}>
-                    {kind === "sale"
-                      ? "List one of your pets for a fixed SOL price — it keeps its level & active buffs."
-                      : "Put a pet up for auction with your own starting bid (in SOL)."}
+                    List a pet for a fixed SOL price. Listing escrows it — it leaves your collection until sold or cancelled. You receive {netPct}% (a {SOL_MARKET_FEE_BPS / 100}% fee goes to the treasury).
                   </p>
                   {cloud && !wallet ? (
                     <p className="empty">🔌 Connect your wallet to list a pet on the market.</p>
+                  ) : listable.length === 0 ? (
+                    <p className="empty">Switch to another pet first — you can't sell your active one.</p>
                   ) : (
                     <div className="list-controls">
                       <select className="name-input list-select" value={listSpecies} onChange={(e) => setListSpecies(e.target.value)}>
                         <option value="">Choose a pet…</option>
-                        {pet.ownedSpecies.map((id) => {
+                        {listable.map((id) => {
                           const info = PETS.find((p) => p.id === id)!;
-                          const lvl = id === pet.species ? pet.level : pet.progress[id]?.level ?? 1;
+                          const lvl = pet.progress[id]?.level ?? 1;
                           return <option key={id} value={id}>{info.label} · Lv {lvl}</option>;
                         })}
                       </select>
@@ -1516,41 +1754,55 @@ export default function App() {
                         type="number"
                         min="0"
                         step="0.01"
-                        placeholder={kind === "sale" ? "Price ◎" : "Start ◎"}
+                        placeholder="Price ◎"
                         value={listPrice}
                         onChange={(e) => setListPrice(e.target.value)}
                       />
-                      <button className="btn btn-primary" onClick={() => listPet(kind)}>{kind === "sale" ? "🏷️ List" : "🔨 Start"}</button>
+                      <button className="btn btn-primary" disabled={listBusy} onClick={listPet}>🏷️ List</button>
                     </div>
                   )}
 
+                  <div className="section-label">Pets for sale</div>
                   {loading ? (
                     <p className="empty">Loading the market… ⏳</p>
                   ) : listings.length === 0 ? (
-                    <p className="empty">No {kind === "sale" ? "listings" : "auctions"} yet — be the first to list a pet!</p>
+                    <p className="empty">No listings yet — be the first to list a pet!</p>
                   ) : (
                     <div className="inv-grid">
                       {listings.map((l) => {
                         const info = PETS.find((p) => p.id === l.species)!;
                         const activeBuffs = l.buffs.filter((b) => b.expiresAt > Date.now()).length;
+                        const owned = !l.mine && !!pet && pet.ownedSpecies.includes(l.species);
                         return (
                           <div key={l.id} className="inv-item inv-item-tall market-listing">
-                            {l.mine && <button className="mini-x" onClick={() => cancelListing(l.id, kind)} title="Cancel listing">✕</button>}
+                            {l.mine && <button className="mini-x" onClick={() => cancelListing(l.id)} title="Cancel listing">✕</button>}
                             <span className="rar-dot" style={{ background: RARITY[info.rarity].color }} />
                             <span className="inv-emoji"><PetArt species={l.species} size={34} /></span>
                             <span className="inv-name">{info.label}</span>
                             <span className="inv-perk">Lv {l.level}{activeBuffs ? ` · ✨${activeBuffs}` : ""}</span>
-                            <span className="inv-feed">{kind === "sale" ? "◎ " : "start ◎ "}{l.price}</span>
-                            <span className="market-seller">{l.mine ? "your listing" : cloud ? shortAddress(l.seller) : "you"}</span>
+                            <span className="inv-feed">◎ {l.price}</span>
+                            {l.mine ? (
+                              <span className="market-seller">your listing</span>
+                            ) : cloud ? (
+                              <button className="btn btn-primary market-buy" disabled={buying || owned} onClick={() => buyPet(l)}>{owned ? "Owned" : "Buy"}</button>
+                            ) : (
+                              <span className="market-seller">you</span>
+                            )}
                           </div>
                         );
                       })}
                     </div>
                   )}
-                  {cloud && <p className="empty" style={{ marginTop: 8 }}>💡 Buying &amp; bidding with SOL is coming next — listings are live now.</p>}
                 </>
               );
             })()}
+
+            {marketTab === "auction" && (
+              <div className="market-empty">
+                <div className="market-empty-emoji">🔨</div>
+                <p className="empty">Live SOL auctions are coming soon — bid on rare pets and win them. Stay tuned!</p>
+              </div>
+            )}
 
             <button className="btn btn-ghost" onClick={() => setModal(null)}>Close</button>
           </div>
@@ -1639,37 +1891,75 @@ export default function App() {
         <div className="scrim" onClick={() => setModal(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
-              <h3>💱 Exchange</h3>
-              <span className="coins"><Coin /> {Math.floor(pet.coins)} {SIL}</span>
+              <h3>💰 Buy PV</h3>
+              <span className="coins"><Coin /> {Math.floor(pet.coins).toLocaleString()} {SIL}</span>
             </div>
-            <p className="subtitle" style={{ marginTop: -4 }}>Swap PV for SOL and back. Buying PV is cheaper than selling it back.</p>
+            <p className="subtitle" style={{ marginTop: -4 }}>Buy PV with real SOL — ◎1 SOL = {SOL_PV_RATE.toLocaleString()} PV. <b>Devnet</b> (test SOL).</p>
 
-            <div className="ex-balances">
-              <div className="ex-bal"><span className="ex-bal-label"><Coin /> PV</span><b>{Math.floor(pet.coins).toLocaleString()}</b></div>
-              <div className="ex-bal"><span className="ex-bal-label">◎ SOL</span><b>{pet.sol}</b></div>
-            </div>
+            {!wallet ? (
+              <p className="empty">🔌 Connect your wallet to buy PV with SOL.</p>
+            ) : (
+              <div className="sil-packs">
+                {SOL_BUY_PACKS.map((s) => (
+                  <button key={s} className="sil-pack" disabled={buying} onClick={() => buyPvReal(s)}>
+                    <span className="sil-pack-amt"><Coin /> {(s * SOL_PV_RATE).toLocaleString()}</span>
+                    <span className="sil-pack-price">◎ {s} SOL</span>
+                  </button>
+                ))}
+              </div>
+            )}
 
-            <div className="section-label">Buy PV — ◎1 SOL → {SOL_BUY_RATE.toLocaleString()} {SIL}</div>
-            <div className="sil-packs">
-              {SOL_BUY_PACKS.map((s) => (
-                <button key={s} className="sil-pack" disabled={pet.sol < s} onClick={() => buySilWithSol(s)}>
-                  <span className="sil-pack-amt"><Coin /> {(s * SOL_BUY_RATE).toLocaleString()}</span>
-                  <span className="sil-pack-price">◎ {s} SOL</span>
-                </button>
-              ))}
-            </div>
+            {wallet && (
+              <>
+                <div className="section-label">Sell PV — {SOL_SELL_RATE.toLocaleString()} PV → ◎1 SOL</div>
+                <div className="sil-packs">
+                  {SOL_SELL_PACKS.map((s) => (
+                    <button key={s} className="sil-pack" disabled={buying || Math.floor(pet.coins) < s} onClick={() => sellPvReq(s)}>
+                      <span className="sil-pack-amt">◎ {+(s / SOL_SELL_RATE).toFixed(4)} SOL</span>
+                      <span className="sil-pack-price"><Coin /> {s.toLocaleString()}</span>
+                    </button>
+                  ))}
+                </div>
+                <p className="empty">📨 Selling creates a request — SOL is paid out after manual approval.</p>
+              </>
+            )}
 
-            <div className="section-label">Sell PV — {SOL_SELL_RATE.toLocaleString()} {SIL} → ◎1 SOL</div>
-            <div className="sil-packs">
-              {SIL_SELL_PACKS.map((s) => (
-                <button key={s} className="sil-pack" disabled={pet.coins < s} onClick={() => sellSilForSol(s)}>
-                  <span className="sil-pack-amt">◎ {+(s / SOL_SELL_RATE).toFixed(4)} SOL</span>
-                  <span className="sil-pack-price"><Coin /> {s.toLocaleString()}</span>
-                </button>
-              ))}
-            </div>
+            {buying && <p className="subtitle" style={{ textAlign: "center" }}>⏳ Processing…</p>}
+            <p className="empty">💡 Running on Solana <b>devnet</b> for testing — pay with free test SOL (faucet.solana.com). Real mainnet SOL comes after testing.</p>
+            <button className="btn btn-ghost" onClick={() => setModal(null)}>Close</button>
+          </div>
+        </div>
+      )}
 
-            <p className="empty">💡 This is a local demo exchange. Real SOL deposits/withdrawals arrive with the Phantom wallet.</p>
+      {/* ===== Admin: sell requests ===== */}
+      {modal === "admin" && isAdmin && (
+        <div className="scrim" onClick={() => setModal(null)}>
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head"><h3>🛠️ Payout requests</h3></div>
+            <p className="subtitle" style={{ marginTop: -4 }}>Approve to pay SOL from the treasury. PV sells can be rejected (refunds PV); pet sales are final.</p>
+            {adminReqs === null ? (
+              <p className="empty">Loading…</p>
+            ) : adminReqs.length === 0 ? (
+              <p className="empty">No pending requests 🎉</p>
+            ) : (
+              <div className="lb-list">
+                {adminReqs.map((r) => {
+                  const isMarket = r.kind === "market";
+                  return (
+                    <div key={r.id} className="admin-req">
+                      <div className="admin-req-info">
+                        <span className="admin-req-amt">{isMarket ? `🏷️ Pet sale → ◎${r.sol}` : <><Coin /> {r.pv.toLocaleString()} → ◎{r.sol}</>}</span>
+                        <span className="admin-req-who" title={r.wallet}>{shortAddress(r.wallet)}</span>
+                      </div>
+                      <div className="admin-req-btns">
+                        <button className="btn btn-primary admin-ok" disabled={payoutBusy} onClick={() => doPayout(r.id, "approve")}>Approve</button>
+                        {!isMarket && <button className="btn btn-ghost admin-no" disabled={payoutBusy} onClick={() => doPayout(r.id, "reject")}>Reject</button>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             <button className="btn btn-ghost" onClick={() => setModal(null)}>Close</button>
           </div>
         </div>

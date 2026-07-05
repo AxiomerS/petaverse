@@ -11,6 +11,7 @@ export type PhantomProvider = {
   connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: PublicKeyLike }>;
   disconnect: () => Promise<void>;
   signMessage: (message: Uint8Array, display?: string) => Promise<{ signature: Uint8Array }>;
+  signAndSendTransaction: (tx: unknown) => Promise<{ signature: string }>;
   on: (event: string, handler: (arg: unknown) => void) => void;
   removeAllListeners: (event: string) => void;
 };
