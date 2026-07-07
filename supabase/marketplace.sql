@@ -285,4 +285,42 @@ do $$ declare p record; begin
     execute format('drop policy %I on public.listings', p.policyname);
   end loop;
 end $$;
+
+-- 6) Rate-limit для buy/market-buy ---------------------------------------------------------------
+-- Эти две edge-функции принимают {wallet, signature} БЕЗ авторизации (проверка идёт по самой
+-- транзакции), и на каждый запрос дёргают платный mainnet RPC (Helius) до 8 раз. Без ограничения
+-- кто угодно может слать мусорные подписи пачками и накручивать счёт/забивать функцию. rl_check —
+-- атомарный счётчик "запросов за окно": INSERT..ON CONFLICT + блокировка строки на время функции,
+-- так что параллельные запросы с одним и тем же ключом (обычно IP) не проходят мимо счётчика.
+create table if not exists public.rate_limits (
+  key          text primary key,   -- обычно IP запроса, отдельно для buy/market-buy
+  count        int not null default 0,
+  window_start bigint not null     -- epoch ms начала текущего окна
+);
+alter table public.rate_limits enable row level security; -- политик нет — только service_role
+
+create or replace function public.rl_check(p_key text, p_max int, p_window_ms bigint, p_now bigint)
+returns boolean
+language plpgsql
+as $$
+declare
+  v_count int;
+  v_start bigint;
+begin
+  insert into public.rate_limits (key, count, window_start) values (p_key, 0, p_now)
+    on conflict (key) do nothing;
+  select count, window_start into v_count, v_start from public.rate_limits where key = p_key for update;
+  if p_now - v_start > p_window_ms then
+    update public.rate_limits set count = 1, window_start = p_now where key = p_key;
+    return true;
+  end if;
+  if v_count >= p_max then
+    return false;
+  end if;
+  update public.rate_limits set count = count + 1 where key = p_key;
+  return true;
+end;
+$$;
+revoke execute on function public.rl_check(text,int,bigint,bigint) from public;
+grant execute on function public.rl_check(text,int,bigint,bigint) to service_role;
 create policy listings_read on public.listings for select using (true);

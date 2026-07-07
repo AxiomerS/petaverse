@@ -1,11 +1,11 @@
-// Supabase Edge Function "market-buy": проверяет devnet-оплату и проводит сделку на маркете.
+// Supabase Edge Function "market-buy": проверяет mainnet-оплату и проводит сделку на маркете.
 // БЕЗ внешних зависимостей (только получаем SOL — казну не подписываем).
 // Клиент присылает { wallet /*покупатель*/, signature, type: 'sale'|'exclusive', refId }. Мы:
 //  1) читаем транзакцию и убеждаемся, что wallet заплатил в treasury достаточную сумму;
 //  2) пишем подпись в market_purchases (PK) → повтор даёт 409, деньги не тратятся дважды;
 //  3) sale     → отдаём лот покупателю (в его сейв), удаляем лот, создаём заявку на выплату продавцу;
 //     exclusive → уменьшаем сток эксклюзива и выдаём пета покупателю (SOL остаётся у казны).
-const RPC = "https://api.devnet.solana.com";
+const RPC = Deno.env.get("HELIUS_RPC_URL") ?? ""; // секрет Supabase (Edge Functions → Secrets) — НЕ хардкодить, ключ виден всем в публичном репо
 const TREASURY = "RjUd1g9rD6ZR1zZMwy5MgfupBGKstvdBLvJ6N7VaDoH";
 const FEE_BPS = 500; // 5% комиссия казны с продажи между игроками
 const SB_URL = Deno.env.get("SUPABASE_URL") ?? "";
@@ -46,12 +46,27 @@ async function writeSave(wallet: string, data: any): Promise<void> {
     body: JSON.stringify({ data, updated_at: new Date().toISOString() }),
   });
 }
+// Без авторизации + до 8 платных RPC-вызовов на запрос → без лимита кто угодно может слать пачки
+// мусорных подписей и накручивать счёт/забивать функцию. rl_check — атомарный счётчик в базе
+// (см. marketplace.sql), общий для всех инстансов функции (не in-memory).
+async function rateLimited(key: string, max: number, windowMs: number): Promise<boolean> {
+  const res = await fetch(`${SB_URL}/rest/v1/rpc/rl_check`, { method: "POST", headers: sbHeaders(), body: JSON.stringify({ p_key: key, p_max: max, p_window_ms: windowMs, p_now: Date.now() }) });
+  const ok = await res.json().catch(() => true);
+  return ok !== true; // rl_check вернул false → лимит исчерпан
+}
+// Грубая проверка формата подписи (base58, длина tx-подписи) ДО обращения к RPC — отсекает совсем
+// мусорные строки бесплатно, не тратя ни одного платного вызова.
+const SIG_RE = /^[1-9A-HJ-NP-Za-km-z]{80,100}$/;
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
     const { wallet, signature, type, refId } = await req.json();
     if (!wallet || !signature || !refId || (type !== "sale" && type !== "exclusive")) return jsonResp({ error: "missing fields" }, 400);
+    if (!SIG_RE.test(signature)) return jsonResp({ error: "bad signature format" }, 400);
+
+    const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+    if (await rateLimited(`market-buy:${ip}`, 15, 60000)) return jsonResp({ error: "too many requests, slow down" }, 429);
 
     // 1) Читаем транзакцию из блокчейна (с повторами — узел может ещё не видеть tx).
     let tx: any = null;

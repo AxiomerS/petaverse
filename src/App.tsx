@@ -71,7 +71,11 @@ function jwtExpMs(token: string): number {
 // видит транзакцию (частый кейс на mainnet при загрузке), подтверждение повторяется — в сессии и при
 // следующем заходе. Всё идемпотентно (подпись — PK), поэтому деньги не теряются и не зачисляются дважды.
 const PENDING_KEY = "petaverse.pending";
-type Pending = { kind: "pv" | "sale" | "exclusive"; sig: string; refId?: string; species?: string; label?: string; ts: number };
+// wallet = реальный плательщик (адрес, вернувшийся из sendSolPayment) — НЕ читаем текущее состояние
+// "wallet" при сверке: если пользователь переключит аккаунт в Phantom между оплатой и подтверждением,
+// state успеет измениться, а платёж был отправлен со старого адреса — сверка на сервере должна идти
+// именно по нему, иначе оплаченный SOL зависнет без начисления.
+type Pending = { kind: "pv" | "sale" | "exclusive"; sig: string; wallet: string; refId?: string; species?: string; label?: string; ts: number };
 function loadPending(): Pending[] {
   try { return JSON.parse(localStorage.getItem(PENDING_KEY) || "[]") as Pending[]; } catch { return []; }
 }
@@ -147,6 +151,10 @@ export default function App() {
 
   const petRef = useRef(pet);
   petRef.current = pet;
+  // Подписи оплат, которые ПРЯМО СЕЙЧАС проверяются: processPurchase (свой цикл ретраев) и 30с-
+  // реконсилятор незавершённых оплат могут случайно пересечься по времени для одной и той же
+  // подписи — без этой защиты оба одновременно дёрнут settlePurchase и покажут два тоста подряд.
+  const settlingRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const iv = setInterval(() => {
       const cur = petRef.current;
@@ -363,21 +371,24 @@ export default function App() {
     return () => clearInterval(iv);
   }, [wallet]);
 
-  // Реконсилятор незавершённых оплат: при подключении+верификации добиваем платежи, которые не успели
-  // подтвердиться в прошлой сессии (сеть уже увидела tx → PV начислится / пет выдастся; идемпотентно).
+  // Реконсилятор незавершённых оплат: добиваем платежи, которые не успели подтвердиться (сеть ещё
+  // не видит tx / RPC подвис) — сеть рано или поздно увидит tx → PV начислится / пет выдастся
+  // (идемпотентно). Раньше это запускалось ТОЛЬКО при смене wallet/verified — если игрок просто
+  // оставался в той же сессии и не переподключался/не перезагружал страницу, платёж мог зависнуть
+  // в pending надолго. Теперь дополнительно повторяем по таймеру, пока сессия открыта.
   useEffect(() => {
     if (!wallet || !verified || !isCloudEnabled()) return;
-    const pend = loadPending();
-    if (!pend.length) return;
     let cancelled = false;
-    (async () => {
-      for (const e of pend) {
+    async function reconcilePending() {
+      for (const e of loadPending()) {
         if (cancelled) return;
         const r = await settlePurchase(e);
         if (r === "done") removePending(e.sig);
       }
-    })();
-    return () => { cancelled = true; };
+    }
+    reconcilePending();
+    const iv = setInterval(reconcilePending, 30000);
+    return () => { cancelled = true; clearInterval(iv); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wallet, verified]);
 
@@ -703,15 +714,34 @@ export default function App() {
   function addPending(e: Pending) { savePending([...loadPending().filter((x) => x.sig !== e.sig), e]); }
   function removePending(sig: string) { savePending(loadPending().filter((x) => x.sig !== sig)); }
 
+  // Убрать список id аксессуаров отовсюду (с активного пета и с прогресса остальных), кроме одного
+  // вида — вызывается, когда питомец с уже надетыми аксессуарами приходит в сейв ИЗВНЕ (покупка на
+  // рынке, возврат при отмене листинга). Без этого один и тот же аксессуар мог оказаться "надет"
+  // сразу на двух питомцах (свой + купленный/возвращённый), если id совпал.
+  function stripAccessoriesElsewhere(activeAccessories: string[], progress: SavedPet["progress"], ids: string[], exceptSpecies: string) {
+    if (!ids.length) return { activeAccessories, progress };
+    const set = new Set(ids);
+    const newActive = activeAccessories.filter((a) => !set.has(a));
+    const newProgress = { ...progress };
+    for (const sp of Object.keys(newProgress)) {
+      if (sp === exceptSpecies) continue;
+      const on = newProgress[sp].accessories ?? [];
+      if (on.some((a) => set.has(a))) newProgress[sp] = { ...newProgress[sp], accessories: on.filter((a) => !set.has(a)) };
+    }
+    return { activeAccessories: newActive, progress: newProgress };
+  }
+
   // Добавить купленного пета в локальный сейв (аддитивно — только этот вид, не затирая свежий прогресс).
   function applyBought(sp: string, serverSave: SavedPet) {
     setPet((p) => {
       if (!p) return hydrateSave(serverSave);
       if (p.ownedSpecies.includes(sp)) return p;
       const prog = serverSave.progress?.[sp] ?? { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: 1, buffs: [] };
-      // Питомец пришёл с надетыми аксессуарами → добавляем их и в общий инвентарь (ownedAccessories).
+      // Питомец пришёл с надетыми аксессуарами → добавляем их и в общий инвентарь (ownedAccessories),
+      // сняв их со всех, на ком они уже могли быть надеты (не должно повторяться, но подстрахуемся).
       const acc = prog.accessories ?? [];
-      const merged = { ...p, ownedSpecies: [...p.ownedSpecies, sp], ownedAccessories: acc.length ? Array.from(new Set([...p.ownedAccessories, ...acc])) : p.ownedAccessories, progress: { ...p.progress, [sp]: prog }, names: serverSave.names?.[sp] ? { ...p.names, [sp]: serverSave.names[sp] } : p.names, updatedAt: Date.now() };
+      const { activeAccessories, progress: strippedProgress } = stripAccessoriesElsewhere(p.accessories, p.progress, acc, sp);
+      const merged = { ...p, accessories: activeAccessories, ownedSpecies: [...p.ownedSpecies, sp], ownedAccessories: acc.length ? Array.from(new Set([...p.ownedAccessories, ...acc])) : p.ownedAccessories, progress: { ...strippedProgress, [sp]: prog }, names: serverSave.names?.[sp] ? { ...p.names, [sp]: serverSave.names[sp] } : p.names, updatedAt: Date.now() };
       if (wallet) saveCloudSave(wallet, merged);
       return merged;
     });
@@ -720,27 +750,36 @@ export default function App() {
   // Подтвердить одну оплату. "retry" = tx ещё не видна (повторить позже); "done" = завершено/ошибка.
   async function settlePurchase(e: Pending): Promise<"done" | "retry"> {
     if (!wallet) return "retry";
-    if (e.kind === "pv") {
-      const res = await confirmPurchase(wallet, e.sig);
-      if ("coins" in res) { setCoins(res.coins); setToast(`✅ +${res.credited.toLocaleString()} ${SIL} added!`); return "done"; }
+    // Эта же подпись уже проверяется другим вызовом (см. settlingRef выше) — не дублируем запрос/тост.
+    if (settlingRef.current.has(e.sig)) return "retry";
+    settlingRef.current.add(e.sig);
+    try {
+      // Старые записи в localStorage (до этого фикса) не хранили wallet — подстрахуемся текущим состоянием.
+      const payer = e.wallet ?? wallet;
+      if (e.kind === "pv") {
+        const res = await confirmPurchase(payer, e.sig);
+        if ("coins" in res) { setCoins(res.coins); setToast(`✅ +${res.credited.toLocaleString()} ${SIL} added!`); return "done"; }
+        if (res.notFound) return "retry";
+        if (res.already) { pvSync(pet?.level ?? 1).then((r) => r && setCoins(r.coins)); setToast(`✅ ${SIL} credited`); return "done"; }
+        setToast(`Purchase issue: ${res.error}`); return "done";
+      }
+      const res = await confirmMarketBuy(e.kind, e.refId!, e.sig, payer);
+      if ("save" in res) {
+        if (e.species) applyBought(e.species, res.save);
+        setToast(`✅ Bought ${e.label ?? "pet"}!`);
+        if (e.kind === "sale") fetchListings("sale").then(setMarketListings);
+        else fetchExclusives().then(setExclusives);
+        return "done";
+      }
       if (res.notFound) return "retry";
-      if (res.already) { pvSync(pet?.level ?? 1).then((r) => r && setCoins(r.coins)); setToast(`✅ ${SIL} credited`); return "done"; }
-      setToast(`Purchase issue: ${res.error}`); return "done";
-    }
-    const res = await confirmMarketBuy(e.kind, e.refId!, e.sig, wallet);
-    if ("save" in res) {
-      if (e.species) applyBought(e.species, res.save);
-      setToast(`✅ Bought ${e.label ?? "pet"}!`);
-      if (e.kind === "sale") fetchListings("sale").then(setMarketListings);
-      else fetchExclusives().then(setExclusives);
+      // Не 404 → сделка завершена на сервере (уже обработано / оформлен возврат). Перечитаем сейв,
+      // чтобы подхватить пета, если он всё же выдан.
+      setToast(res.refund ? "Couldn't complete — refund queued (admin returns your SOL)" : "Purchase settled");
+      loadCloudSave(wallet).then((s) => { if (s) setPet(hydrateSave(s)); });
       return "done";
+    } finally {
+      settlingRef.current.delete(e.sig);
     }
-    if (res.notFound) return "retry";
-    // Не 404 → сделка завершена на сервере (уже обработано / оформлен возврат). Перечитаем сейв,
-    // чтобы подхватить пета, если он всё же выдан.
-    setToast(res.refund ? "Couldn't complete — refund queued (admin returns your SOL)" : "Purchase settled");
-    loadCloudSave(wallet).then((s) => { if (s) setPet(hydrateSave(s)); });
-    return "done";
   }
 
   // Обработать оплату: сохранить в pending, затем повторять подтверждение с бэкоффом.
@@ -761,10 +800,10 @@ export default function App() {
     setBuying(true);
     setToast("Confirm the payment in Phantom…");
     try {
-      const sig = await sendSolPayment(sol);
-      if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
+      const paid = await sendSolPayment(sol);
+      if (!paid) { setBuying(false); return setToast("Payment cancelled"); }
       setToast("Verifying payment on-chain…");
-      await processPurchase({ kind: "pv", sig, ts: Date.now() });
+      await processPurchase({ kind: "pv", sig: paid.signature, wallet: paid.payer, ts: Date.now() });
     } catch {
       setToast("Purchase failed");
     }
@@ -1090,11 +1129,15 @@ export default function App() {
   function restorePet(species: string, level: number, buffs: { kind: BuffKind; expiresAt: number }[], accessories: string[], name?: string) {
     if (!pet || pet.ownedSpecies.includes(species)) return;
     const nm = name || pet.names[species];
+    // Как и в applyBought: снять эти аксессуары со всех, на ком они уже могли быть надеты, прежде
+    // чем "надеть" их обратно на возвращаемого пета — иначе id может задвоиться.
+    const { activeAccessories, progress: strippedProgress } = stripAccessoriesElsewhere(pet.accessories, pet.progress, accessories, species);
     const updated = {
       ...pet,
+      accessories: activeAccessories,
       ownedSpecies: [...pet.ownedSpecies, species],
       ownedAccessories: accessories.length ? Array.from(new Set([...pet.ownedAccessories, ...accessories])) : pet.ownedAccessories,
-      progress: { ...pet.progress, [species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: level || 1, buffs: buffs ?? [], accessories } },
+      progress: { ...strippedProgress, [species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: level || 1, buffs: buffs ?? [], accessories } },
       names: nm ? { ...pet.names, [species]: nm } : pet.names,
       updatedAt: Date.now(),
     };
@@ -1146,10 +1189,10 @@ export default function App() {
     setBuying(true);
     setToast("Confirm the payment in Phantom…");
     try {
-      const sig = await sendSolPayment(listing.price);
-      if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
+      const paid = await sendSolPayment(listing.price);
+      if (!paid) { setBuying(false); return setToast("Payment cancelled"); }
       setToast("Verifying payment on-chain…");
-      await processPurchase({ kind: "sale", sig, refId: listing.id, species: listing.species, label, ts: Date.now() });
+      await processPurchase({ kind: "sale", sig: paid.signature, wallet: paid.payer, refId: listing.id, species: listing.species, label, ts: Date.now() });
     } catch {
       setToast("Purchase failed");
     }
@@ -1165,10 +1208,10 @@ export default function App() {
     setBuying(true);
     setToast("Confirm the payment in Phantom…");
     try {
-      const sig = await sendSolPayment(ex.price);
-      if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
+      const paid = await sendSolPayment(ex.price);
+      if (!paid) { setBuying(false); return setToast("Payment cancelled"); }
       setToast("Verifying payment on-chain…");
-      await processPurchase({ kind: "exclusive", sig, refId: ex.id, species: ex.species, label, ts: Date.now() });
+      await processPurchase({ kind: "exclusive", sig: paid.signature, wallet: paid.payer, refId: ex.id, species: ex.species, label, ts: Date.now() });
     } catch {
       setToast("Purchase failed");
     }

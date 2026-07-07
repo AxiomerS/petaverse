@@ -4,7 +4,7 @@
 // Доступ только у ADMIN (проверяем claim wallet в JWT тем же JWT_SECRET, что и в auth).
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "npm:@solana/web3.js@1.95.8";
 
-const RPC = "https://api.devnet.solana.com";
+const RPC = Deno.env.get("HELIUS_RPC_URL") ?? ""; // секрет Supabase (Edge Functions → Secrets) — НЕ хардкодить, ключ виден всем в публичном репо
 const ADMIN = "EezTHmjK2x4zYDSSjRwQadrgVsfapMUu9HtBMFXyTrPk";
 const MAX_PAYOUT_SOL = 5; // предохранитель: авто-выплату больше этого казна не отправит (разбирать вручную)
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? "";
@@ -32,12 +32,15 @@ async function rpcNum(fn: string, args: Record<string, unknown>): Promise<number
   const n = Number(v);
   return v === null || v === undefined || !Number.isFinite(n) ? null : n;
 }
+// resolution=ignore-duplicates -> INSERT ... ON CONFLICT DO NOTHING: если строку только что создал
+// параллельный запрос (гонка при самом первом обращении кошелька), наш INSERT молча ничего не делает,
+// а не ПЕРЕЗАПИСЫВАЕТ (как было с merge-duplicates) уже атомарно изменённый другим запросом баланс.
 async function ensureBalanceRow(wallet: string): Promise<void> {
   const brows = await fetch(`${SB_URL}/rest/v1/balances?wallet=eq.${encodeURIComponent(wallet)}&select=wallet`, { headers: sbHeaders() }).then((r) => r.json());
   if (brows?.[0]) return;
   const sRows = await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}&select=data`, { headers: sbHeaders() }).then((r) => r.json());
   const coins = Math.floor(Number(sRows?.[0]?.data?.coins ?? 0)) || 0;
-  await fetch(`${SB_URL}/rest/v1/balances`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal,resolution=merge-duplicates" }), body: JSON.stringify({ wallet, coins, last_collect: Date.now(), updated_at: new Date().toISOString() }) });
+  await fetch(`${SB_URL}/rest/v1/balances`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal,resolution=ignore-duplicates" }), body: JSON.stringify({ wallet, coins, last_collect: Date.now(), updated_at: new Date().toISOString() }) });
 }
 function b64urlToBytes(s: string): Uint8Array {
   s = s.replace(/-/g, "+").replace(/_/g, "/");
@@ -57,6 +60,16 @@ async function walletFromJwt(auth: string | null): Promise<string | null> {
   const pl = JSON.parse(new TextDecoder().decode(b64urlToBytes(p[1])));
   if (pl.exp && pl.exp * 1000 < Date.now()) return null;
   return pl.wallet ?? null;
+}
+// Проверить on-chain, что подпись реально успешно исполнена (не просто отправлена).
+async function txSucceeded(conn: Connection, sig: string): Promise<boolean> {
+  try {
+    const res = await conn.getSignatureStatuses([sig], { searchTransactionHistory: true });
+    const st = res.value[0];
+    return !!st && !st.err && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized");
+  } catch {
+    return false;
+  }
 }
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function base58Decode(str: string): Uint8Array {
@@ -128,9 +141,18 @@ Deno.serve(async (req) => {
       await setStatus("pending"); // ключа нет — ничего не отправляли, возвращаем в очередь
       return jsonResp({ error: "treasury key not set (TREASURY_SECRET)" }, 500);
     }
+    const conn = new Connection(RPC, "confirmed");
+
+    // Если у заявки уже ЕСТЬ подпись с прошлой попытки (approve после reset, когда confirm упал по
+    // сети, но перевод мог уйти) — СНАЧАЛА проверяем её on-chain, прежде чем слать НОВЫЙ перевод.
+    // Без этой проверки reset+approve после сетевого сбоя мог отправить казну платить дважды.
+    if (reqRow.sig && (await txSucceeded(conn, reqRow.sig))) {
+      await setStatus("paid", reqRow.sig);
+      return jsonResp({ ok: true, status: "paid", sig: reqRow.sig });
+    }
+
     try {
       const kp = Keypair.fromSecretKey(base58Decode(TREASURY_SECRET));
-      const conn = new Connection(RPC, "confirmed");
       const lamports = Math.round(Number(reqRow.sol) * LAMPORTS_PER_SOL);
       const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
       const tx = new Transaction({ feePayer: kp.publicKey, blockhash, lastValidBlockHeight }).add(
@@ -138,12 +160,16 @@ Deno.serve(async (req) => {
       );
       tx.sign(kp);
       const sig = await conn.sendRawTransaction(tx.serialize());
+      // Подпись сохраняем СРАЗУ, до confirmTransaction — если подтверждение упадёт по сети, у reset+approve
+      // будет чем свериться on-chain перед повторной отправкой (см. проверку выше).
+      await setStatus("paying", sig);
       await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
       await setStatus("paid", sig);
       return jsonResp({ ok: true, status: "paid", sig });
     } catch (e) {
       // Отправка/подтверждение упали. НЕ возвращаем в pending (tx мог уйти) — помечаем error,
-      // чтобы избежать повторной выплаты; заявку разбираем вручную.
+      // чтобы избежать повторной выплаты; заявку разбираем вручную (или reset+approve свернёт сам,
+      // если tx на самом деле прошла — см. проверку reqRow.sig выше).
       await setStatus("error");
       return jsonResp({ error: `payout failed: ${String(e)}` }, 500);
     }

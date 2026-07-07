@@ -161,7 +161,9 @@ Deno.serve(async (req) => {
     if (action === "list") {
       const species = String(body.species ?? "");
       const price = Number(body.price);
-      if (!species || !(price > 0)) return jsonResp({ error: "bad listing" }, 400);
+      // Number.isFinite отсекает Infinity/NaN (просто "price > 0" пропускает Infinity) — иначе можно
+      // выставить лот с ценой Infinity, который потом никто не сможет купить (сломанный листинг).
+      if (!species || !Number.isFinite(price) || !(price > 0) || price > 100000) return jsonResp({ error: "bad listing" }, 400);
       const taken = await rpc("pet_take", { p_wallet: wallet, p_species: species });
       if (taken.length === 0) return jsonResp({ error: "you don't own this pet" }, 409);
       const row = taken[0];

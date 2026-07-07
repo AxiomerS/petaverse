@@ -55,6 +55,12 @@ async function walletFromJwt(auth: string | null): Promise<string | null> {
 type Bal = { wallet: string; coins: number; last_daily: number; last_collect: number; last_run_reward: number; battle_day: number; battle_gain: number };
 
 // Получить строку баланса; если её нет — создать из текущего сейва (ленивый бэкфилл).
+// resolution=ignore-duplicates -> INSERT ... ON CONFLICT DO NOTHING: если строку только что создал
+// параллельный запрос (гонка при самом первом обращении кошелька), наш INSERT молча ничего не делает,
+// а не ПЕРЕЗАПИСЫВАЕТ (как было с merge-duplicates) уже атомарно изменённый другим запросом баланс.
+// Возвращённый `row` в этом случае может быть устаревшим (не тот, что реально в базе), но это не
+// страшно: все последующие мутации идут через отдельные атомарные pv_* RPC, читающие текущую строку
+// заново — `row` тут используется только для чтения last_daily в ответе sync/collect.
 async function getOrCreate(wallet: string): Promise<Bal> {
   const rows = await fetch(`${SB_URL}/rest/v1/balances?wallet=eq.${encodeURIComponent(wallet)}&select=*`, { headers: sbHeaders() }).then((r) => r.json());
   if (rows?.[0]) return rows[0] as Bal;
@@ -62,7 +68,7 @@ async function getOrCreate(wallet: string): Promise<Bal> {
   const coins = Math.floor(Number(saveRows?.[0]?.data?.coins ?? 0)) || 0;
   const now = Date.now();
   const row = { wallet, coins, last_daily: 0, last_collect: now, last_run_reward: 0, battle_day: 0, battle_gain: 0 };
-  await fetch(`${SB_URL}/rest/v1/balances`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal,resolution=merge-duplicates" }), body: JSON.stringify({ ...row, updated_at: new Date(now).toISOString() }) });
+  await fetch(`${SB_URL}/rest/v1/balances`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal,resolution=ignore-duplicates" }), body: JSON.stringify({ ...row, updated_at: new Date(now).toISOString() }) });
   return row;
 }
 // Вызвать атомарную SQL-функцию баланса. Возвращает новый баланс (number) или null, если условие
