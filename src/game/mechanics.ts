@@ -1,6 +1,6 @@
 import { type BuffKind, activeMult } from "./buffs";
 import { equippedBonuses, mythicAcc, accById } from "./accessories";
-import { speciesEffect } from "./pets";
+import { speciesEffect, isBasePet } from "./pets";
 
 export type Stats = { fullness: number; happiness: number; health: number };
 
@@ -22,15 +22,40 @@ export const HAPPINESS_DECAY = 8;
 export const HEALTH_DECAY = 10;
 export const HEALTH_RECOVER = 5;
 
-export function decay(stats: Stats, from: number, to: number, mult: { f: number; h: number } = { f: 1, h: 1 }, cap = 100): Stats {
-  const hours = Math.max(0, (to - from) / 3_600_000);
+// rate — общий множитель скорости (1 = обычный питомец; 0.1 = неактивный пет, распад в 10 раз медленнее).
+// starveOnly — здоровье падает ТОЛЬКО от голода (fullness ≤ 0), а не от несчастья. Для БАЗОВЫХ питомцев:
+// они умирают только если их не кормить, и никак иначе (грусть их не убивает).
+export function decay(stats: Stats, from: number, to: number, mult: { f: number; h: number } = { f: 1, h: 1 }, cap = 100, rate = 1, starveOnly = false): Stats {
+  const hours = Math.max(0, (to - from) / 3_600_000) * rate;
   if (hours === 0) return stats;
   const fullness = clamp(stats.fullness - FULLNESS_DECAY * hours * mult.f, cap);
   const happiness = clamp(stats.happiness - HAPPINESS_DECAY * hours * mult.h, cap);
   let health = stats.health;
-  if (fullness <= 0 || happiness <= 0) health -= HEALTH_DECAY * hours;
+  if (fullness <= 0 || (!starveOnly && happiness <= 0)) health -= HEALTH_DECAY * hours;
   else if (fullness >= 50 && happiness >= 50) health += HEALTH_RECOVER * hours;
   return { fullness, happiness, health: clamp(health) };
+}
+
+// Неактивные питомцы игрока тоже теряют статы — но в 10 раз медленнее (INACTIVE_DECAY_RATE). Пока пет
+// неактивен, он НЕ умирает (health не опускается ниже 1): смерть возможна только у активного пета,
+// которого не кормят. У неактивных нет надетых аксессуаров — распад считаем по их виду/баффам/уровню.
+// accessories — аксессуары, надетые ИМЕННО на этого (неактивного) пета. Остаются на нём при переключении
+// и уходят вместе с ним при продаже. Опционально (старые сейвы без поля читаем как []).
+export type PetProgress = { stats: Stats; xp: number; level: number; buffs: { kind: BuffKind; expiresAt: number }[]; accessories?: string[] };
+export const INACTIVE_DECAY_RATE = 0.1;
+export function decayInactive(progress: Record<string, PetProgress>, from: number, to: number): Record<string, PetProgress> {
+  const out: Record<string, PetProgress> = {};
+  for (const sp of Object.keys(progress)) {
+    const pr = progress[sp];
+    // Уже мёртвый неактивный пет заморожен (оживить — только платно). Иначе бы floor(1) «воскрешал» его.
+    if (pr.stats.health <= 0) { out[sp] = pr; continue; }
+    const cap = statCap(pr.level);
+    const dm = decayMult(pr.buffs ?? [], [], sp, to);
+    const st = decay(pr.stats, from, to, dm, cap, INACTIVE_DECAY_RATE, isBasePet(sp));
+    // Живой неактивный пет не умирает, пока неактивен (health не ниже 1) — смерть только у активного.
+    out[sp] = { ...pr, stats: { ...st, health: Math.max(1, st.health) } };
+  }
+  return out;
 }
 
 // Итоговые множители распада: баффы × перки аксессуаров (усилены видовым "acc") × видовой распад.

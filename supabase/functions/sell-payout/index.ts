@@ -6,6 +6,7 @@ import { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PE
 
 const RPC = "https://api.devnet.solana.com";
 const ADMIN = "EezTHmjK2x4zYDSSjRwQadrgVsfapMUu9HtBMFXyTrPk";
+const MAX_PAYOUT_SOL = 5; // предохранитель: авто-выплату больше этого казна не отправит (разбирать вручную)
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? "";
 const SB_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SERVICE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -21,6 +22,22 @@ function jsonResp(b: unknown, s = 200): Response {
 }
 function sbHeaders(e?: Record<string, string>) {
   return { apikey: SERVICE, Authorization: `Bearer ${SERVICE}`, "Content-Type": "application/json", ...e };
+}
+// Атомарная SQL-функция баланса (pv_add_checked) + гарантия строки баланса — чтобы возврат PV при reject
+// не затирал параллельное начисление (lost update).
+async function rpcNum(fn: string, args: Record<string, unknown>): Promise<number | null> {
+  const res = await fetch(`${SB_URL}/rest/v1/rpc/${fn}`, { method: "POST", headers: sbHeaders(), body: JSON.stringify(args) });
+  const data = await res.json().catch(() => null);
+  const v = Array.isArray(data) ? data[0] : data;
+  const n = Number(v);
+  return v === null || v === undefined || !Number.isFinite(n) ? null : n;
+}
+async function ensureBalanceRow(wallet: string): Promise<void> {
+  const brows = await fetch(`${SB_URL}/rest/v1/balances?wallet=eq.${encodeURIComponent(wallet)}&select=wallet`, { headers: sbHeaders() }).then((r) => r.json());
+  if (brows?.[0]) return;
+  const sRows = await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}&select=data`, { headers: sbHeaders() }).then((r) => r.json());
+  const coins = Math.floor(Number(sRows?.[0]?.data?.coins ?? 0)) || 0;
+  await fetch(`${SB_URL}/rest/v1/balances`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal,resolution=merge-duplicates" }), body: JSON.stringify({ wallet, coins, last_collect: Date.now(), updated_at: new Date().toISOString() }) });
 }
 function b64urlToBytes(s: string): Uint8Array {
   s = s.replace(/-/g, "+").replace(/_/g, "/");
@@ -77,6 +94,11 @@ Deno.serve(async (req) => {
 
     if (reqRow.status !== "pending") return jsonResp({ error: "already handled" }, 409);
 
+    // Предохранитель: авто-выплату сверх лимита казна не отправляет (аномальную заявку разбираем вручную).
+    if (action === "approve" && Number(reqRow.sol) > MAX_PAYOUT_SOL) {
+      return jsonResp({ error: `payout ${reqRow.sol} SOL exceeds cap ${MAX_PAYOUT_SOL} — handle manually from the treasury` }, 400);
+    }
+
     // АТОМАРНЫЙ ЗАХВАТ: переводим pending → paying/rejecting условным UPDATE (WHERE status=pending).
     // Так двойной клик Approve/Reject не проходит: второй запрос обновит 0 строк и выйдет с 409.
     // Это чинит гонку, из-за которой казна могла заплатить несколько раз за одну продажу.
@@ -89,14 +111,11 @@ Deno.serve(async (req) => {
     if (!Array.isArray(claimed) || claimed.length === 0) return jsonResp({ error: "already handled" }, 409);
 
     if (action === "reject") {
-      // Возвращаем PV только для ЧИСТОЙ продажи PV (kind='sell'). market/refund PV не держат — не возвращаем.
-      const sRows = reqRow.kind !== "sell"
-        ? []
-        : await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(reqRow.wallet)}&select=data`, { headers: sbHeaders() }).then((r) => r.json());
-      const data = sRows?.[0]?.data;
-      if (data) {
-        const coins = Math.floor((data.coins ?? 0) + reqRow.pv);
-        await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(reqRow.wallet)}`, { method: "PATCH", headers: sbHeaders({ Prefer: "return=minimal" }), body: JSON.stringify({ data: { ...data, coins }, updated_at: new Date().toISOString() }) });
+      // Возвращаем удержанные PV в СЕРВЕРНЫЙ balances АТОМАРНО (только для чистой продажи PV; market/refund
+      // PV не держат). pv_add_checked не гонится с параллельным начислением.
+      if (reqRow.kind === "sell" && Number(reqRow.pv) > 0) {
+        await ensureBalanceRow(reqRow.wallet);
+        await rpcNum("pv_add_checked", { p_wallet: reqRow.wallet, p_delta: Number(reqRow.pv), p_min: 0 });
       }
       await fetch(`${SB_URL}/rest/v1/sell_requests?id=eq.${encodeURIComponent(id)}`, { method: "PATCH", headers: sbHeaders({ Prefer: "return=minimal" }), body: JSON.stringify({ status: "rejected" }) });
       return jsonResp({ ok: true, status: "rejected" });

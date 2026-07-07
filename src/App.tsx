@@ -7,12 +7,12 @@ import { loadoutPower, activePowerBuff, accPower, accHp, accCrit } from "./game/
 import { ACCESSORIES, accById, SLOTS, STARTER_ACCESSORIES, equippedBonuses, accDesc, mythicAcc } from "./game/accessories";
 import { BUFFS, type BuffKind } from "./game/buffs";
 import { FOOD_CHESTS, ACC_CHESTS, PET_CHESTS, bestTier, fmtChance, type PoolItem } from "./game/chests";
-import { type Stats, clamp, xpForLevel, decay, decayMult, silRate, levelSilMult, statCap, DAILY_REWARD, DAILY_COOLDOWN, START_COINS, GRANT_V } from "./game/mechanics";
+import { type Stats, clamp, xpForLevel, decay, decayMult, decayInactive, levelSilMult, BASE_SIL_PER_MIN, statCap, DAILY_REWARD, DAILY_COOLDOWN, START_COINS, GRANT_V } from "./game/mechanics";
 import { POTIONS, potionById, potionEffects, potionTitle, type Potion } from "./game/potions";
 import { QUESTS } from "./game/quests";
 import { type SavedPet, STORAGE_KEY, loadPet, hydrateSave, type MarketListing } from "./game/save";
 import { getPhantom, shortAddress, signMessageHex, PHANTOM_INSTALL_URL } from "./game/wallet";
-import { isCloudEnabled, loadCloudSave, saveCloudSave, submitScore, fetchTopScores, submitArena, fetchTopArena, upsertPvpProfile, findPvpOpponent, fetchListings, createListing, deleteListing, confirmMarketBuy, fetchExclusives, createExclusive, deleteExclusive, createQuestClaim, fetchQuestClaims, markQuestClaimPaid, signIn, setSessionToken, confirmPurchase, requestSell, fetchSellRequests, fetchStuckSellRequests, payoutSell, type ScoreRow, type ArenaRow, type Listing, type Exclusive, type SellRequest, type QuestClaim } from "./game/cloud";
+import { isCloudEnabled, loadCloudSave, saveCloudSave, submitScore, fetchTopScores, submitArena, fetchTopArena, upsertPvpProfile, findPvpOpponent, fetchListings, confirmMarketBuy, fetchExclusives, createExclusive, deleteExclusive, createQuestClaim, fetchQuestClaims, markQuestClaimPaid, pvSync, pvDaily, pvSpend, pvRoulette, pvBattle, pvRunReward, isVerified, signIn, setSessionToken, confirmPurchase, requestSell, fetchSellRequests, fetchStuckSellRequests, payoutSell, petsSync, petsStarter, petsChest, petsBreed, petsList, petsCancel, type ScoreRow, type ArenaRow, type Listing, type Exclusive, type SellRequest, type QuestClaim, type LedgerPet } from "./game/cloud";
 import { sendSolPayment, SOL_PV_RATE, SOL_BUY_PACKS, SOL_SELL_RATE, SOL_SELL_PACKS, SOL_MARKET_FEE_BPS } from "./game/pay";
 import { SPIN_MS, playSpinSound, playWinSound } from "./game/audio";
 import { Coin, StatBar } from "./components/ui";
@@ -67,15 +67,27 @@ function jwtExpMs(token: string): number {
   try { return (JSON.parse(atob(token.split(".")[1])).exp ?? 0) * 1000; } catch { return 0; }
 }
 
+// Незавершённые оплаты: подпись сохраняется СРАЗУ после платежа, до подтверждения. Если сеть ещё не
+// видит транзакцию (частый кейс на mainnet при загрузке), подтверждение повторяется — в сессии и при
+// следующем заходе. Всё идемпотентно (подпись — PK), поэтому деньги не теряются и не зачисляются дважды.
+const PENDING_KEY = "petaverse.pending";
+type Pending = { kind: "pv" | "sale" | "exclusive"; sig: string; refId?: string; species?: string; label?: string; ts: number };
+function loadPending(): Pending[] {
+  try { return JSON.parse(localStorage.getItem(PENDING_KEY) || "[]") as Pending[]; } catch { return []; }
+}
+function savePending(list: Pending[]) {
+  try { localStorage.setItem(PENDING_KEY, JSON.stringify(list)); } catch { /* игнорируем */ }
+}
+
 // Воскрешение: цена лекарства = база + за каждый уровень питомца.
 const REVIVE_BASE = 50;
-const REVIVE_PER_LEVEL = 100;
+const REVIVE_PER_LEVEL = 100;      // rare+ питомцы
+const REVIVE_PER_LEVEL_BASE = 50;  // базовые (dog/cat/hamster) — дешевле оживить
 
-// Скрещивание: открыто, когда есть два питомца уровня BREED_LEVEL+. Стоит BREED_COST,
-// даёт случайного нового питомца (rare+) с хорошими шансами на высокие редкости.
+// Скрещивание: открыто, когда есть два питомца уровня BREED_LEVEL+. Стоит BREED_COST, даёт случайного
+// нового питомца (rare+). Phase 2: шансы/исход/проверку родителей выполняет СЕРВЕР (edge fn pets).
 const BREED_LEVEL = 5;
 const BREED_COST = 1000;
-const BREED_ODDS: Partial<Record<Rarity, number>> = { rare: 25, epic: 40, legendary: 27, mythic: 8 };
 
 export default function App() {
   const [pet, setPet] = useState<SavedPet | null>(() => loadPet());
@@ -138,30 +150,30 @@ export default function App() {
   useEffect(() => {
     const iv = setInterval(() => {
       const cur = petRef.current;
-      // Мёртвый питомец заморожен — оживить лекарством. НО базовые питомцы не умирают,
-      // поэтому их тик работает всегда (здоровье само восстанавливается при сытости/счастье ≥50).
-      if (!cur || (cur.stats.health <= 0 && !isBasePet(cur.species))) return;
+      // Мёртвый питомец (health = 0) заморожен — оживить лекарством. Касается ВСЕХ, включая базовых:
+      // базовый пет умирает, если его не кормить (см. starveOnly в decay).
+      if (!cur || cur.stats.health <= 0) return;
       const now = Date.now();
       const buffs = cur.buffs.filter((b) => b.expiresAt > now);
       const potions = cur.potions.filter((p) => p.expiresAt > now); // активные зелья
       const potEff = potionEffects(potions, now);
       const hours = (now - cur.updatedAt) / 3_600_000;
       const mr = mythicAcc(cur.accessories);
-      // Пассивный Sil копится ТОЛЬКО пока приложение активно тикает: засчитываем не больше
-      // одного интервала тика (≤5с) — так доход не набегает за фон/оффлайн. Зелье Sil усиливает доход.
-      const earnMs = Math.min(now - cur.updatedAt, 5000);
-      const earned = (earnMs / 60000) * silRate(cur.accessories, cur.species) * (1 + potEff.sil) * levelSilMult(cur.level);
+      // Пассивный PV теперь начисляет СЕРВЕР (edge fn pv, collect) — в клиентском тике его не трогаем.
       // Decay, then add mythic regen (leash→fullness, toy→happiness). Cap растёт с уровнем.
       // Зелье Vitality замедляет распад (множим итоговый decayMult на (1 − potEff.decay)).
       const cap = statCap(cur.level);
       const dm = decayMult(buffs, cur.accessories, cur.species, now);
-      let stats = decay(cur.stats, cur.updatedAt, now, { f: dm.f * (1 - potEff.decay), h: dm.h * (1 - potEff.decay) }, cap);
+      // starveOnly для базовых: их здоровье падает только от голода (fullness = 0), не от несчастья.
+      let stats = decay(cur.stats, cur.updatedAt, now, { f: dm.f * (1 - potEff.decay), h: dm.h * (1 - potEff.decay) }, cap, 1, isBasePet(cur.species));
       stats = { ...stats, fullness: clamp(stats.fullness + mr.fRegen * hours, cap), happiness: clamp(stats.happiness + mr.hRegen * hours, cap) };
       // Passive XP from a mythic cap → level up while enough.
       let xp = cur.xp + mr.xpHr * hours;
       let level = cur.level;
       while (xp >= xpForLevel(level)) { xp -= xpForLevel(level); level++; }
-      setPet({ ...cur, coins: cur.coins + earned, stats, xp, level, buffs, potions, updatedAt: now });
+      // Неактивные питомцы игрока тоже распадаются — в 10 раз медленнее (и не умирают, пока неактивны).
+      const progress = decayInactive(cur.progress, cur.updatedAt, now);
+      setPet({ ...cur, stats, xp, level, buffs, potions, progress, updatedAt: now });
     }, 3000);
     return () => clearInterval(iv);
   }, []);
@@ -227,10 +239,58 @@ export default function App() {
         if (p && p.battleWins + p.battleLosses > 0)
           submitArena({ wallet, name: p.name, species: p.species, power: loadoutPower(p.level, p.accessories, 0).power, wins: p.battleWins, losses: p.battleLosses });
         if (p) upsertPvpProfile({ wallet, name: p.name, species: p.species, level: p.level, accessories: p.accessories }); // профиль для PvP
+        // Авторитетный баланс PV с сервера (начисляет пассив + бэкфилл). Требует верификации (JWT).
+        if (p) pvSync(p.level).then((r) => { if (r && !cancelled) setPet((pp) => (pp ? { ...pp, coins: r.coins, lastDaily: r.lastDaily } : pp)); });
       })
       .finally(() => { if (!cancelled) setCloudLoading(false); });
     return () => { cancelled = true; };
   }, [wallet]);
+
+  // Phase 2: авторитетный список владения — из pet_ledger (не из сейва). Сливаем его в сейв, где
+  // ownedSpecies становится ЗЕРКАЛОМ леджера (как coins — зеркало balances). Так подделанный
+  // ownedSpecies в localStorage — просто картинка: продать за SOL можно лишь то, что есть в леджере.
+  useEffect(() => {
+    if (!wallet || !verified || !isCloudEnabled()) return;
+    let cancelled = false;
+    (async () => {
+      let ledger = await petsSync();
+      if (cancelled || !ledger) return;
+      // Леджер пуст → аккаунт ещё не в серверной модели (создан офлайн до Phase 2). Сеем стартер из
+      // активного вида, если он обычный (бесплатный), затем перечитываем.
+      if (ledger.length === 0) {
+        const p = petRef.current;
+        if (p && isBasePet(p.species)) {
+          await petsStarter(p.species, p.name);
+          ledger = (await petsSync()) ?? [];
+        }
+      }
+      if (cancelled || ledger.length === 0) return;
+      mergeLedger(ledger);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wallet, verified]);
+
+  // Привести сейв в соответствие с леджером: ownedSpecies = виды из леджера; имена/прогресс неактивных
+  // видов дозаполняем из леджера; убираем из progress виды, которых в леджере уже нет (проданы/фейковые).
+  function mergeLedger(ledger: LedgerPet[]) {
+    setPet((p) => {
+      if (!p) return p;
+      const owned = ledger.map((l) => l.species);
+      const names = { ...p.names };
+      const progress = { ...p.progress };
+      for (const l of ledger) {
+        if (l.name && !names[l.species]) names[l.species] = l.name;
+        if (l.species !== p.species && !progress[l.species]) {
+          progress[l.species] = { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: l.level ?? 1, buffs: l.buffs ?? [] };
+        }
+      }
+      for (const sp of Object.keys(progress)) if (!owned.includes(sp)) delete progress[sp];
+      const next = { ...p, ownedSpecies: owned, names, progress, updatedAt: Date.now() };
+      if (wallet) saveCloudSave(wallet, next);
+      return next;
+    });
+  }
 
   // Лидерборд: подгружаем глобальный топ при открытии модалки Ranks.
   useEffect(() => {
@@ -297,9 +357,29 @@ export default function App() {
       if (!p) return;
       saveCloudSave(wallet, p);
       upsertPvpProfile({ wallet, name: p.name, species: p.species, level: p.level, accessories: p.accessories });
+      // Пассив начисляет сервер: периодически синхронизируем баланс (если кошелёк верифицирован).
+      if (isVerified()) pvSync(p.level).then((r) => { if (r) setPet((pp) => (pp ? { ...pp, coins: r.coins } : pp)); });
     }, 20000);
     return () => clearInterval(iv);
   }, [wallet]);
+
+  // Реконсилятор незавершённых оплат: при подключении+верификации добиваем платежи, которые не успели
+  // подтвердиться в прошлой сессии (сеть уже увидела tx → PV начислится / пет выдастся; идемпотентно).
+  useEffect(() => {
+    if (!wallet || !verified || !isCloudEnabled()) return;
+    const pend = loadPending();
+    if (!pend.length) return;
+    let cancelled = false;
+    (async () => {
+      for (const e of pend) {
+        if (cancelled) return;
+        const r = await settlePurchase(e);
+        if (r === "done") removePending(e.sig);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wallet, verified]);
 
   function createPet() {
     if (!picked || !name.trim()) return;
@@ -333,6 +413,9 @@ export default function App() {
       grantV: GRANT_V,
       updatedAt: Date.now(),
     });
+    // Phase 2: стартовый питомец выдаётся сервером в pet_ledger (если кошелёк уже верифицирован;
+    // иначе засеется позже при синхронизации леджера). ownedSpecies в сейве — лишь зеркало.
+    if (wallet && verified && isCloudEnabled()) petsStarter(picked, name.trim());
   }
 
 
@@ -341,17 +424,12 @@ export default function App() {
     return Math.ceil(base * (pet ? 1 - speciesEffect(pet.species).shop : 1));
   }
 
-  // Buy a food → goes into the inventory (does NOT feed immediately).
-  function buyFood(food: Food) {
+  // Buy a food → goes into the inventory (does NOT feed immediately). PV списывается на сервере.
+  async function buyFood(food: Food) {
     if (!pet) return;
     const cost = price(food.cost);
-    if (pet.coins < cost) return setToast(`Not enough ${SIL}`);
-    setPet({
-      ...pet,
-      coins: pet.coins - cost,
-      inventory: { ...pet.inventory, [food.id]: (pet.inventory[food.id] ?? 0) + 1 },
-    });
-    setToast(`Bought ${food.label} ${food.emoji}`);
+    const ok = await doSpend(cost, (coins) => setPet((p) => (p ? { ...p, coins, inventory: { ...p.inventory, [food.id]: (p.inventory[food.id] ?? 0) + 1 } } : p)));
+    if (ok) setToast(`Bought ${food.label} ${food.emoji}`);
   }
 
   // Open a chest → build a roulette strip, scroll it, then drop the food into the inventory.
@@ -370,17 +448,14 @@ export default function App() {
     return { strip, colors };
   }
 
-  // Food chest.
-  function openChest(c: (typeof FOOD_CHESTS)[number]) {
+  // Food chest. Анимацию запускаем СРАЗУ (предмет уже выбран), PV списываем на сервере параллельно —
+  // так нет паузы перед прокрутом. При отказе сервера отменяем показ и откатываем баланс.
+  async function openChest(c: (typeof FOOD_CHESTS)[number]) {
     if (!pet) return;
     const cost = price(c.cost);
-    if (pet.coins < cost) return setToast(`Not enough ${SIL}`);
+    if (!rewardsUnlocked) return setToast(`Connect & verify your wallet to spend ${SIL}`);
+    if (Math.floor(pet.coins) < cost) return setToast(`Not enough ${SIL}`);
     const won = rollFood(c.odds);
-    setPet({
-      ...pet,
-      coins: pet.coins - cost,
-      inventory: { ...pet.inventory, [won.id]: (pet.inventory[won.id] ?? 0) + 1 },
-    });
     setReelOffset(0);
     const reel = buildStrip(FOODS, won);
     setChest({
@@ -390,13 +465,19 @@ export default function App() {
       winIdx: REEL_WIN,
       revealed: false,
     });
+    const res = await pvSpend(cost);
+    if ("error" in res) {
+      if (typeof res.coins === "number") setCoins(res.coins);
+      setChest(null);
+      return setToast(res.error === "not enough PV" ? `Not enough ${SIL}` : "Purchase failed — try again");
+    }
+    setPet((p) => (p ? { ...p, coins: res.coins, inventory: { ...p.inventory, [won.id]: (p.inventory[won.id] ?? 0) + 1 } } : p));
   }
 
   // Accessory chest → roll a rarity by the chest's odds, then a random unowned accessory.
-  function openAccessoryChest(c: (typeof ACC_CHESTS)[number]) {
+  async function openAccessoryChest(c: (typeof ACC_CHESTS)[number]) {
     if (!pet) return;
     const cost = price(c.cost);
-    if (pet.coins < cost) return setToast(`Not enough ${SIL}`);
     const missing = ACCESSORIES.filter((a) => !pet.ownedAccessories.includes(a.id));
     if (missing.length === 0) return setToast("You own every accessory! 🎉");
     // Roll a rarity; if nothing of that rarity is left, fall back to any unowned.
@@ -404,11 +485,8 @@ export default function App() {
     const pool = missing.filter((a) => a.rarity === rarity);
     const from = pool.length ? pool : missing;
     const won = from[Math.floor(Math.random() * from.length)];
-    setPet({
-      ...pet,
-      coins: pet.coins - cost,
-      ownedAccessories: [...pet.ownedAccessories, won.id],
-    });
+    if (!rewardsUnlocked) return setToast(`Connect & verify your wallet to spend ${SIL}`);
+    if (Math.floor(pet.coins) < cost) return setToast(`Not enough ${SIL}`);
     setReelOffset(0);
     const reel = buildStrip(ACCESSORIES, won);
     setChest({
@@ -418,6 +496,13 @@ export default function App() {
       winIdx: REEL_WIN,
       revealed: false,
     });
+    const res = await pvSpend(cost);
+    if ("error" in res) {
+      if (typeof res.coins === "number") setCoins(res.coins);
+      setChest(null);
+      return setToast(res.error === "not enough PV" ? `Not enough ${SIL}` : "Purchase failed — try again");
+    }
+    setPet((p) => (p ? { ...p, coins: res.coins, ownedAccessories: [...p.ownedAccessories, won.id] } : p));
   }
 
   // Animate the roulette: start at 0, then slide so the winning item lands under the pointer.
@@ -438,19 +523,23 @@ export default function App() {
     };
   }, [chest]);
 
-  // Pet chest → roll a rarity by odds, then a random species the player doesn't own.
-  function openPetChest(c: (typeof PET_CHESTS)[number]) {
+  // Pet chest (Phase 2): вид и списание PV решает СЕРВЕР (edge fn pets → pet_ledger). Клиент только
+  // показывает результат. Так пета нельзя намайнить, подделав сейв — он появляется только в леджере.
+  async function openPetChest(c: (typeof PET_CHESTS)[number]) {
     if (!pet) return;
-    const cost = price(c.cost);
-    if (pet.coins < cost) return setToast(`Not enough ${SIL}`);
+    if (!rewardsUnlocked) return setToast(`Connect & verify your wallet to spend ${SIL}`);
     // Common starter pets (dog/cat/hamster) are never dropped by chests.
     const missing = PETS.filter((p) => p.rarity !== "common" && !pet.ownedSpecies.includes(p.id));
     if (missing.length === 0) return setToast("You own every pet! 🎉");
-    const rarity = rollRarity(c.odds);
-    const pool = missing.filter((p) => p.rarity === rarity);
-    const from = pool.length ? pool : missing;
-    const won = from[Math.floor(Math.random() * from.length)];
-    setPet({ ...pet, coins: pet.coins - cost, ownedSpecies: [...pet.ownedSpecies, won.id] });
+    if (Math.floor(pet.coins) < price(c.cost)) return setToast(`Not enough ${SIL}`);
+    // Сервер: списывает PV, бросает кубик, пишет пета в леджер. active — для скидки магазина по перку.
+    const res = await petsChest(c.id, pet.species);
+    if ("error" in res) {
+      if (typeof res.coins === "number") setCoins(res.coins);
+      return setToast(res.error === "not enough PV" ? `Not enough ${SIL}` : res.error === "own all" ? "You own every pet! 🎉" : "Purchase failed — try again");
+    }
+    const won = PETS.find((p) => p.id === res.species);
+    if (!won) return;
     setReelOffset(0);
     const reel = buildStrip(PETS, won);
     setChest({
@@ -460,6 +549,7 @@ export default function App() {
       winIdx: REEL_WIN,
       revealed: false,
     });
+    setPet((p) => (p ? { ...p, coins: res.coins, ownedSpecies: [...p.ownedSpecies, won.id], updatedAt: Date.now() } : p));
   }
 
   // Spin the previewed chest (pay + roll + animation), then close the preview.
@@ -533,10 +623,23 @@ export default function App() {
     );
   }
 
-  // Изменить баланс Sil на delta (функционально — чтобы не затирать пассивный доход тика).
-  // Используется рулеткой: списание ставки и начисление выигрыша.
-  function addCoins(delta: number) {
-    setPet((prev) => (prev ? { ...prev, coins: Math.max(0, prev.coins + delta), updatedAt: Date.now() } : prev));
+  // Обновить локальное ЗЕРКАЛО баланса PV значением, пришедшим с сервера (авторитет — balances).
+  function setCoins(coins: number) {
+    setPet((prev) => (prev ? { ...prev, coins, updatedAt: Date.now() } : prev));
+  }
+  // Списать PV на СЕРВЕРЕ под покупку; при успехе применить эффект (apply получает новый баланс).
+  // Экономика требует верифицированного кошелька (баланс живёт на сервере).
+  async function doSpend(cost: number, apply: (coins: number) => void): Promise<boolean> {
+    if (!rewardsUnlocked) { setToast(`Connect & verify your wallet to spend ${SIL}`); return false; }
+    if (pet && Math.floor(pet.coins) < cost) { setToast(`Not enough ${SIL}`); return false; }
+    const res = await pvSpend(cost);
+    if ("error" in res) {
+      if (typeof res.coins === "number") setCoins(res.coins);
+      setToast(res.error === "not enough PV" ? `Not enough ${SIL}` : "Purchase failed — try again");
+      return false;
+    }
+    apply(res.coins);
+    return true;
   }
 
   // Подключить кошелёк Phantom (по кнопке). Нет расширения → отправляем на установку.
@@ -597,22 +700,71 @@ export default function App() {
     }
   }
 
+  function addPending(e: Pending) { savePending([...loadPending().filter((x) => x.sig !== e.sig), e]); }
+  function removePending(sig: string) { savePending(loadPending().filter((x) => x.sig !== sig)); }
+
+  // Добавить купленного пета в локальный сейв (аддитивно — только этот вид, не затирая свежий прогресс).
+  function applyBought(sp: string, serverSave: SavedPet) {
+    setPet((p) => {
+      if (!p) return hydrateSave(serverSave);
+      if (p.ownedSpecies.includes(sp)) return p;
+      const prog = serverSave.progress?.[sp] ?? { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: 1, buffs: [] };
+      // Питомец пришёл с надетыми аксессуарами → добавляем их и в общий инвентарь (ownedAccessories).
+      const acc = prog.accessories ?? [];
+      const merged = { ...p, ownedSpecies: [...p.ownedSpecies, sp], ownedAccessories: acc.length ? Array.from(new Set([...p.ownedAccessories, ...acc])) : p.ownedAccessories, progress: { ...p.progress, [sp]: prog }, names: serverSave.names?.[sp] ? { ...p.names, [sp]: serverSave.names[sp] } : p.names, updatedAt: Date.now() };
+      if (wallet) saveCloudSave(wallet, merged);
+      return merged;
+    });
+  }
+
+  // Подтвердить одну оплату. "retry" = tx ещё не видна (повторить позже); "done" = завершено/ошибка.
+  async function settlePurchase(e: Pending): Promise<"done" | "retry"> {
+    if (!wallet) return "retry";
+    if (e.kind === "pv") {
+      const res = await confirmPurchase(wallet, e.sig);
+      if ("coins" in res) { setCoins(res.coins); setToast(`✅ +${res.credited.toLocaleString()} ${SIL} added!`); return "done"; }
+      if (res.notFound) return "retry";
+      if (res.already) { pvSync(pet?.level ?? 1).then((r) => r && setCoins(r.coins)); setToast(`✅ ${SIL} credited`); return "done"; }
+      setToast(`Purchase issue: ${res.error}`); return "done";
+    }
+    const res = await confirmMarketBuy(e.kind, e.refId!, e.sig, wallet);
+    if ("save" in res) {
+      if (e.species) applyBought(e.species, res.save);
+      setToast(`✅ Bought ${e.label ?? "pet"}!`);
+      if (e.kind === "sale") fetchListings("sale").then(setMarketListings);
+      else fetchExclusives().then(setExclusives);
+      return "done";
+    }
+    if (res.notFound) return "retry";
+    // Не 404 → сделка завершена на сервере (уже обработано / оформлен возврат). Перечитаем сейв,
+    // чтобы подхватить пета, если он всё же выдан.
+    setToast(res.refund ? "Couldn't complete — refund queued (admin returns your SOL)" : "Purchase settled");
+    loadCloudSave(wallet).then((s) => { if (s) setPet(hydrateSave(s)); });
+    return "done";
+  }
+
+  // Обработать оплату: сохранить в pending, затем повторять подтверждение с бэкоффом.
+  async function processPurchase(e: Pending) {
+    addPending(e);
+    for (let i = 0; i < 3; i++) {
+      const r = await settlePurchase(e);
+      if (r === "done") { removePending(e.sig); return; }
+      await new Promise((res) => setTimeout(res, 4000));
+    }
+    setToast("Payment sent — finalizing on-chain. We'll keep retrying automatically.");
+  }
+
   // Реальная покупка PV за SOL: Phantom отправляет SOL на treasury → сервер проверяет и начисляет PV.
   async function buyPvReal(sol: number) {
     if (!wallet) return setToast("Connect wallet first");
+    if (!verified) return setToast("Verify your wallet first (wallet menu)");
     setBuying(true);
     setToast("Confirm the payment in Phantom…");
     try {
       const sig = await sendSolPayment(sol);
       if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
       setToast("Verifying payment on-chain…");
-      const res = await confirmPurchase(wallet, sig);
-      if ("coins" in res) {
-        setPet((p) => (p ? { ...p, coins: res.coins, updatedAt: Date.now() } : p));
-        setToast(`✅ +${res.credited.toLocaleString()} ${SIL} added!`);
-      } else {
-        setToast(`Paid, but crediting failed: ${res.error}`);
-      }
+      await processPurchase({ kind: "pv", sig, ts: Date.now() });
     } catch {
       setToast("Purchase failed");
     }
@@ -664,9 +816,9 @@ export default function App() {
     setPayoutBusy(false);
   }
 
-  // Цена лекарства для воскрешения = база + за уровень питомца.
-  function reviveCostFor(level: number): number {
-    return REVIVE_BASE + REVIVE_PER_LEVEL * level;
+  // Цена лекарства для воскрешения = база + за уровень. Базовые питомцы дешевле (50 + 50/уровень).
+  function reviveCostFor(level: number, species: string): number {
+    return REVIVE_BASE + (isBasePet(species) ? REVIVE_PER_LEVEL_BASE : REVIVE_PER_LEVEL) * level;
   }
 
   // Сколько fullness тратит игра: 5 при заходе <7с, иначе 5 + 5 за каждые 20с игры.
@@ -675,12 +827,11 @@ export default function App() {
     return sec < 7 ? 5 : 5 + 5 * Math.floor(sec / 20);
   }
 
-  // Итог боя в Игре №2. Победа → Sil + XP + забрать вещь + выигрыш ставки.
-  function battleWin(kind: "accessory" | "food", id: string, bet: number) {
+  // Итог боя в Игре №2. Победа → XP + вещь локально; PV (ставка + капнутая награда) считает СЕРВЕР.
+  async function battleWin(kind: "accessory" | "food", id: string, bet: number) {
     if (!pet) return;
     const now = Date.now();
-    const stake = Math.min(Math.max(0, bet), pet.coins); // выигрыш ставки (столько же, сколько поставил)
-    const silReward = 40 + pet.level * 10;
+    const stake = Math.min(Math.max(0, bet), Math.floor(pet.coins));
     let xp = pet.xp + 60;
     let level = pet.level;
     while (xp >= xpForLevel(level)) { xp -= xpForLevel(level); level++; }
@@ -694,18 +845,24 @@ export default function App() {
       inventory = { ...pet.inventory, [id]: (pet.inventory[id] ?? 0) + 1 };
       lootLabel = FOODS.find((f) => f.id === id)?.label ?? "food";
     }
-    setPet({ ...pet, coins: pet.coins + silReward + stake, xp, level, battleWins: pet.battleWins + 1, inventory, ownedAccessories, updatedAt: now });
+    const res = await pvBattle(stake, true, pet.level); // серверный расчёт PV
+    const coins = "error" in res ? pet.coins : res.coins;
+    setPet({ ...pet, coins, xp, level, battleWins: pet.battleWins + 1, inventory, ownedAccessories, updatedAt: now });
     if (wallet) submitArena({ wallet, name: pet.name, species: pet.species, power: loadoutPower(pet.level, pet.accessories, 0).power, wins: pet.battleWins + 1, losses: pet.battleLosses });
-    setToast(`🏆 Victory! +${silReward}${stake ? `+${stake} bet` : ""} ${SIL}, +60 XP, looted ${lootLabel}`);
+    const pvNote = "error" in res ? " (PV needs a verified wallet)" : res.locked ? " · arena PV unlocks at 10+ players" : "";
+    setToast(`🏆 Victory! +60 XP, looted ${lootLabel}${pvNote}`);
   }
 
-  // Поражение: питомец теряет 10 HP (в обморок НЕ падает) и проигрывает ставку.
-  function battleLose(bet: number) {
+  // Поражение: питомец теряет 10 HP (в обморок НЕ падает) и проигрывает ставку (списывает СЕРВЕР).
+  async function battleLose(bet: number) {
     if (!pet) return;
     const now = Date.now();
-    const stake = Math.min(Math.max(0, bet), pet.coins);
-    const health = Math.max(0, pet.stats.health - 10);
-    setPet({ ...pet, stats: { ...pet.stats, health }, coins: pet.coins - stake, battleLosses: pet.battleLosses + 1, updatedAt: now });
+    const stake = Math.min(Math.max(0, bet), Math.floor(pet.coins));
+    // Базовые питомцы умирают ТОЛЬКО от голода — бой не может их убить (пол здоровья = 1).
+    const health = Math.max(isBasePet(pet.species) ? 1 : 0, pet.stats.health - 10);
+    const res = await pvBattle(stake, false, pet.level);
+    const coins = "error" in res ? pet.coins : res.coins;
+    setPet({ ...pet, stats: { ...pet.stats, health }, coins, battleLosses: pet.battleLosses + 1, updatedAt: now });
     if (wallet) submitArena({ wallet, name: pet.name, species: pet.species, power: loadoutPower(pet.level, pet.accessories, 0).power, wins: pet.battleWins, losses: pet.battleLosses + 1 });
     setToast(`💔 Defeat! ${pet.name} took 10 damage${stake ? ` and lost ${stake} ${SIL}` : ""}`);
   }
@@ -721,14 +878,12 @@ export default function App() {
     setPet({ ...pet, buffs, updatedAt: now });
     setToast(`🤚 ${pet.name} feels loved — 🤚 Cuddled: −10% decay for 1h`);
   }
-  // Воскресить мёртвого питомца за лекарство (покупается в магазине).
-  function revivePet() {
+  // Воскресить мёртвого питомца за лекарство (PV списывается на сервере).
+  async function revivePet() {
     if (!pet || pet.stats.health > 0) return;
-    const cost = reviveCostFor(pet.level);
-    if (pet.coins < cost) return setToast(`Need ${cost} ${SIL} for medicine`);
-    setPet({ ...pet, coins: pet.coins - cost, stats: { fullness: 60, happiness: 60, health: 60 }, updatedAt: Date.now() });
-    setToast(`💊 ${pet.name} is back on its paws!`);
-    setModal(null);
+    const cost = reviveCostFor(pet.level, pet.species);
+    const ok = await doSpend(cost, (coins) => setPet((p) => (p ? { ...p, coins, stats: { fullness: 60, happiness: 60, health: 60 }, updatedAt: Date.now() } : p)));
+    if (ok) { setToast(`💊 ${pet.name} is back on its paws!`); setModal(null); }
   }
 
   // Уровень любого питомца игрока (активного — из level, остальных — из progress).
@@ -738,16 +893,20 @@ export default function App() {
     return pet.progress[id]?.level ?? 1;
   }
 
-  // Скрестить двух выбранных питомцев → новый случайный питомец (rare+), которого ещё нет.
-  function breed() {
+  // Скрестить двух выбранных питомцев → новый случайный (rare+). Phase 2: родителей (владение + уровень)
+  // и исход проверяет/решает СЕРВЕР по леджеру; клиент не может подсунуть чужих родителей или фейкового пета.
+  async function breed() {
     if (!pet || breedSel.length !== 2) return;
-    if (pet.coins < BREED_COST) return setToast(`Need ${BREED_COST} ${SIL}`);
-    const missing = PETS.filter((p) => p.rarity !== "common" && !pet.ownedSpecies.includes(p.id));
-    if (missing.length === 0) return setToast("You own every pet! 🎉");
-    const rarity = rollRarity(BREED_ODDS);
-    const pool = missing.filter((p) => p.rarity === rarity);
-    const won = (pool.length ? pool : missing)[Math.floor(Math.random() * (pool.length ? pool.length : missing.length))];
-    setPet({ ...pet, coins: pet.coins - BREED_COST, ownedSpecies: [...pet.ownedSpecies, won.id], updatedAt: Date.now() });
+    if (!rewardsUnlocked) return setToast(`Connect & verify your wallet to spend ${SIL}`);
+    if (Math.floor(pet.coins) < BREED_COST) return setToast(`Not enough ${SIL}`);
+    const res = await petsBreed(breedSel);
+    if ("error" in res) {
+      if (typeof res.coins === "number") setCoins(res.coins);
+      return setToast(res.error === "not enough PV" ? `Not enough ${SIL}` : res.error === "own all" ? "You own every pet! 🎉" : "Breeding failed — try again");
+    }
+    const won = PETS.find((p) => p.id === res.species);
+    if (!won) return;
+    setPet((p) => (p ? { ...p, coins: res.coins, ownedSpecies: [...p.ownedSpecies, won.id], updatedAt: Date.now() } : p));
     setBred({ id: won.id, rarity: won.rarity });
   }
   function closeBreed() {
@@ -770,11 +929,31 @@ export default function App() {
   function doSwitch(id: string, names: Record<string, string>) {
     if (!pet) return;
     const now = Date.now();
-    const progress = { ...pet.progress, [pet.species]: { stats: pet.stats, xp: pet.xp, level: pet.level, buffs: pet.buffs } };
+    // Снапшотим активного пета (включая надетые на него аксессуары), затем загружаем прогресс цели.
+    const progress = { ...pet.progress, [pet.species]: { stats: pet.stats, xp: pet.xp, level: pet.level, buffs: pet.buffs, accessories: pet.accessories } };
     const saved = progress[id];
-    const next = saved ?? { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: 1, buffs: [] };
+    const next = saved ?? { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: 1, buffs: [], accessories: [] };
     delete progress[id]; // it's the active pet now
-    setPet({ ...pet, species: id as PetId, name: names[id], names, stats: next.stats, xp: next.xp, level: next.level, buffs: next.buffs, progress, updatedAt: now });
+    setPet({ ...pet, species: id as PetId, name: names[id], names, stats: next.stats, xp: next.xp, level: next.level, buffs: next.buffs, accessories: next.accessories ?? [], progress, updatedAt: now });
+  }
+  // Аварийное БЕСПЛАТНОЕ воскрешение: доступно, только когда ВСЕ питомцы мертвы (иначе soft-lock —
+  // нечем зарабатывать/играть). Оживляем выбранного пета и делаем активным, но с уровнем на 1 меньше
+  // (плата за бесплатность). Условие allDead исчезает после первого воскрешения → ровно один раз за раз.
+  function freeReviveAll(species: string) {
+    if (!pet || !allDead || !pet.ownedSpecies.includes(species)) return;
+    const now = Date.now();
+    // Снапшотим текущего активного (он тоже мёртв) в progress, если оживляем не его.
+    const progress = { ...pet.progress };
+    if (species !== pet.species) {
+      progress[pet.species] = { stats: pet.stats, xp: pet.xp, level: pet.level, buffs: pet.buffs, accessories: pet.accessories };
+    }
+    const curLevel = species === pet.species ? pet.level : (progress[species]?.level ?? 1);
+    const accessories = species === pet.species ? pet.accessories : (progress[species]?.accessories ?? []);
+    const level = Math.max(1, curLevel - 1); // штраф −1 уровень
+    delete progress[species]; // становится активным
+    const name = pet.names[species] ?? pet.name;
+    setPet({ ...pet, species: species as PetId, name, stats: { fullness: 60, happiness: 60, health: 60 }, xp: 0, level, buffs: [], accessories, progress, updatedAt: now });
+    setToast(`💖 Free revive! ${name} is back at level ${level}`);
   }
   // Назвать нового пета и сразу выбрать его.
   function confirmPetName() {
@@ -786,20 +965,28 @@ export default function App() {
   }
 
   // Equip / unequip an owned accessory. Only one per type (one cap, one leash, etc.).
+  // Аксессуары привязаны к питомцу: надетый остаётся на нём при переключении и уходит с ним при продаже.
+  // При надевании на активного пета аксессуар ПЕРЕНОСИТСЯ с другого пета (убираем из его progress),
+  // чтобы один и тот же аксессуар не оказался сразу на двоих (без дублей).
   function toggleAccessory(id: string) {
     if (!pet) return;
     const acc = accById(id);
     if (!acc) return;
     const worn = pet.accessories.includes(id);
-    let next: string[];
     if (worn) {
-      next = pet.accessories.filter((a) => a !== id);
-    } else {
-      // Remove any other equipped accessory of the same type, then add this one.
-      const sameType: string[] = ACCESSORIES.filter((a) => a.type === acc.type).map((a) => a.id);
-      next = [...pet.accessories.filter((a) => !sameType.includes(a)), id];
+      setPet({ ...pet, accessories: pet.accessories.filter((a) => a !== id), updatedAt: Date.now() });
+      return;
     }
-    setPet({ ...pet, accessories: next });
+    // Снимаем аксессуар того же типа с активного, добавляем этот.
+    const sameType: string[] = ACCESSORIES.filter((a) => a.type === acc.type).map((a) => a.id);
+    const accessories = [...pet.accessories.filter((a) => !sameType.includes(a)), id];
+    // Переносим: убираем этот id у всех неактивных питомцев, если он был надет на ком-то из них.
+    const progress = { ...pet.progress };
+    for (const sp of Object.keys(progress)) {
+      const on = progress[sp].accessories ?? [];
+      if (on.includes(id)) progress[sp] = { ...progress[sp], accessories: on.filter((a) => a !== id) };
+    }
+    setPet({ ...pet, accessories, progress, updatedAt: Date.now() });
   }
 
   // Награды (daily/рулетка) — только для подключённого+верифицированного кошелька: тогда кулдаун
@@ -807,24 +994,22 @@ export default function App() {
   // новый локальный «аккаунт» (для нового старта нужен реально новый кошелёк Phantom — это трение).
   const rewardsUnlocked = !!wallet && verified;
   const dailyReady = pet ? Date.now() - pet.lastDaily >= DAILY_COOLDOWN : false;
-  function claimDaily() {
+  // Дейли начисляет СЕРВЕР (фиксированная сумма, кулдаун серверный → сброс очисткой localStorage не работает).
+  async function claimDaily() {
     if (!pet || !dailyReady) return;
     if (!rewardsUnlocked) return setToast("Connect & verify your wallet to claim daily rewards");
-    const sp = speciesEffect(pet.species);
-    const potEff = potionEffects(pet.potions, Date.now());
-    const dailyMult = equippedBonuses(pet.accessories).daily * (1 + sp.acc) + sp.daily + potEff.daily;
-    const amount = Math.round(DAILY_REWARD * (1 + dailyMult));
-    setPet({ ...pet, coins: pet.coins + amount, lastDaily: Date.now(), updatedAt: Date.now() });
-    setToast(`Daily reward: +${amount} ${SIL}`);
+    const res = await pvDaily();
+    if ("error" in res) { if (typeof res.coins === "number") setCoins(res.coins); return setToast("Daily not ready yet"); }
+    setPet((p) => (p ? { ...p, coins: res.coins, lastDaily: Date.now(), updatedAt: Date.now() } : p));
+    setToast(`Daily reward: +${res.credited} ${SIL}`);
   }
 
-  // Купить зелье → в инвентарь зелий (не выпивается сразу).
-  function buyPotion(p: Potion) {
+  // Купить зелье → в инвентарь зелий (не выпивается сразу). PV списывается на сервере.
+  async function buyPotion(p: Potion) {
     if (!pet) return;
     const cost = price(p.cost);
-    if (pet.coins < cost) return setToast(`Not enough ${SIL}`);
-    setPet({ ...pet, coins: pet.coins - cost, potionInv: { ...pet.potionInv, [p.id]: (pet.potionInv[p.id] ?? 0) + 1 } });
-    setToast(`Bought ${p.label} ${p.emoji}`);
+    const ok = await doSpend(cost, (coins) => setPet((pp) => (pp ? { ...pp, coins, potionInv: { ...pp.potionInv, [p.id]: (pp.potionInv[p.id] ?? 0) + 1 } } : pp)));
+    if (ok) setToast(`Bought ${p.label} ${p.emoji}`);
   }
   // Выпить зелье → активирует временный бафф (обновляет таймер, если такое уже активно).
   function drinkPotion(id: string) {
@@ -871,42 +1056,45 @@ export default function App() {
     setListBusy(true);
     const lvl = pet.progress[species]?.level ?? 1;
     const buffs = pet.progress[species]?.buffs ?? [];
+    const accessories = pet.progress[species]?.accessories ?? []; // надетые на пета аксессуары — уходят с ним
     const name = pet.names[species] ?? "";
     const id = `l${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
     setListSpecies("");
     setListPrice("");
-    // Изымаем пета из инвентаря продавца (species остаётся в names — пригодится при возврате).
+    // Изымаем пета из инвентаря продавца (species остаётся в names). Аксессуары пета тоже покидают продавца
+    // (убираем их из ownedAccessories — они переходят к покупателю вместе с петом).
     const progress = { ...pet.progress };
     delete progress[species];
-    const base = { ...pet, ownedSpecies: pet.ownedSpecies.filter((s) => s !== species), progress, updatedAt: Date.now() };
+    const base = { ...pet, ownedSpecies: pet.ownedSpecies.filter((s) => s !== species), ownedAccessories: pet.ownedAccessories.filter((a) => !accessories.includes(a)), progress, updatedAt: Date.now() };
     if (wallet && isCloudEnabled()) {
-      setPet(base);
-      saveCloudSave(wallet, base); // сразу фиксируем изъятие, чтобы автосейв не вернул пета
-      const ok = await createListing({ id, seller: wallet, kind: "sale", species, level: lvl, buffs, price: askPrice, name });
-      if (!ok) {
-        // Лот не создался → откатываем эскроу (иначе пет потерян: изъят, но не выставлен).
-        setPet(pet);
-        saveCloudSave(wallet, pet);
+      // Phase 2: эскроу делает СЕРВЕР — pet_take забирает пета из леджера и создаёт лот. Не владеешь по
+      // леджеру (подделанный сейв) → лот не создастся, продать за SOL нельзя. Уровень/имя/аксессуары — витрина.
+      const res = await petsList(species, askPrice, lvl, buffs, name, accessories);
+      if ("error" in res) {
         setListBusy(false);
-        return setToast("Couldn't list — pet returned to you");
+        return setToast(res.error === "you don't own this pet" ? "You don't own this pet" : "Couldn't list — try again");
       }
+      // Успех → обновляем локальное зеркало (убираем вид + его аксессуары), чтобы автосейв их не вернул.
+      setPet(base);
+      saveCloudSave(wallet, base);
       fetchListings("sale").then(setMarketListings);
     } else {
       // Локальный лот (без облака) — виден только тебе.
-      setPet({ ...base, listings: [...base.listings, { id, kind: "sale", species, level: lvl, buffs, price: askPrice, createdAt: Date.now() } as MarketListing] });
+      setPet({ ...base, listings: [...base.listings, { id, kind: "sale", species, level: lvl, buffs, accessories, price: askPrice, createdAt: Date.now() } as MarketListing] });
     }
     setToast("🏷️ Pet listed for sale");
     setListBusy(false);
   }
 
-  // Вернуть эскроу-пета продавцу (в ownedSpecies/progress/names). Имя берём из лота или из своей карты.
-  function restorePet(species: string, level: number, buffs: { kind: BuffKind; expiresAt: number }[], name?: string) {
+  // Вернуть эскроу-пета продавцу (в ownedSpecies/progress/names) вместе с его аксессуарами.
+  function restorePet(species: string, level: number, buffs: { kind: BuffKind; expiresAt: number }[], accessories: string[], name?: string) {
     if (!pet || pet.ownedSpecies.includes(species)) return;
     const nm = name || pet.names[species];
     const updated = {
       ...pet,
       ownedSpecies: [...pet.ownedSpecies, species],
-      progress: { ...pet.progress, [species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: level || 1, buffs: buffs ?? [] } },
+      ownedAccessories: accessories.length ? Array.from(new Set([...pet.ownedAccessories, ...accessories])) : pet.ownedAccessories,
+      progress: { ...pet.progress, [species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: level || 1, buffs: buffs ?? [], accessories } },
       names: nm ? { ...pet.names, [species]: nm } : pet.names,
       updatedAt: Date.now(),
     };
@@ -918,12 +1106,13 @@ export default function App() {
   async function cancelListing(id: string) {
     if (!pet) return;
     if (wallet && isCloudEnabled()) {
-      const deleted = await deleteListing(id, wallet);
+      // Phase 2: сервер удаляет лот и возвращает пета в леджер (pet_grant). restored=false → уже куплен.
+      const res = await petsCancel(id);
       fetchListings("sale").then(setMarketListings);
-      if (deleted && deleted.length > 0) {
-        const lot = deleted[0];
-        restorePet(lot.species, lot.level, lot.buffs ?? [], lot.name);
-      } else if (deleted && deleted.length === 0) {
+      if ("error" in res) return setToast("Couldn't cancel — try again");
+      if (res.restored && res.species) {
+        restorePet(res.species, res.level ?? 1, res.buffs ?? [], res.accessories ?? [], res.name ?? undefined);
+      } else {
         setToast("This pet was already sold");
       }
     } else {
@@ -931,11 +1120,13 @@ export default function App() {
       const lot = pet.listings.find((l) => l.id === id);
       const listings = pet.listings.filter((l) => l.id !== id);
       if (lot && !pet.ownedSpecies.includes(lot.species)) {
+        const acc = lot.accessories ?? [];
         setPet({
           ...pet,
           listings,
           ownedSpecies: [...pet.ownedSpecies, lot.species],
-          progress: { ...pet.progress, [lot.species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: lot.level || 1, buffs: lot.buffs ?? [] } },
+          ownedAccessories: acc.length ? Array.from(new Set([...pet.ownedAccessories, ...acc])) : pet.ownedAccessories,
+          progress: { ...pet.progress, [lot.species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: lot.level || 1, buffs: lot.buffs ?? [], accessories: acc } },
           updatedAt: Date.now(),
         });
       } else {
@@ -944,7 +1135,8 @@ export default function App() {
     }
   }
 
-  // Купить пета с рынка игроков за реальный SOL (оплата в казну → сервер проверяет tx и передаёт пета).
+  // Купить пета с рынка игроков за реальный SOL. Оплата → processPurchase (сохранит подпись и
+  // повторит подтверждение, если сеть ещё не видит tx — деньги не потеряются).
   async function buyPet(listing: { id: string; species: string; price: number; seller: string }) {
     if (!wallet) return setToast("Connect wallet first");
     if (!verified) return setToast("Verify your wallet first (wallet menu)");
@@ -957,37 +1149,14 @@ export default function App() {
       const sig = await sendSolPayment(listing.price);
       if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
       setToast("Verifying payment on-chain…");
-      const res = await confirmMarketBuy("sale", listing.id, sig, wallet);
-      if ("save" in res) {
-        // Аддитивно добавляем ТОЛЬКО купленного вида — иначе затрём петов, полученных локально
-        // за последние ≤20с (сундук/разведение), которых ещё нет в облачном сейве сервера.
-        const sp = listing.species;
-        setPet((p) => {
-          if (!p) return hydrateSave(res.save);
-          if (p.ownedSpecies.includes(sp)) return p;
-          const prog = res.save.progress?.[sp] ?? { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: 1, buffs: [] };
-          const merged = {
-            ...p,
-            ownedSpecies: [...p.ownedSpecies, sp],
-            progress: { ...p.progress, [sp]: prog },
-            names: res.save.names?.[sp] ? { ...p.names, [sp]: res.save.names[sp] } : p.names,
-            updatedAt: Date.now(),
-          };
-          if (wallet) saveCloudSave(wallet, merged);
-          return merged;
-        });
-        setToast(`✅ Bought ${label}! It's in your collection.`);
-        fetchListings("sale").then(setMarketListings);
-      } else {
-        setToast(res.error.includes("refund") ? `Couldn't complete — your SOL will be refunded (${res.error.replace(" — refund queued", "")})` : `Paid, but transfer failed: ${res.error}`);
-      }
+      await processPurchase({ kind: "sale", sig, refId: listing.id, species: listing.species, label, ts: Date.now() });
     } catch {
       setToast("Purchase failed");
     }
     setBuying(false);
   }
 
-  // Купить эксклюзивного пета у казны за реальный SOL.
+  // Купить эксклюзивного пета у казны за реальный SOL (та же схема с повтором подтверждения).
   async function buyExclusive(ex: Exclusive) {
     if (!wallet) return setToast("Connect wallet first");
     if (!verified) return setToast("Verify your wallet first (wallet menu)");
@@ -999,29 +1168,7 @@ export default function App() {
       const sig = await sendSolPayment(ex.price);
       if (!sig) { setBuying(false); return setToast("Payment cancelled"); }
       setToast("Verifying payment on-chain…");
-      const res = await confirmMarketBuy("exclusive", ex.id, sig, wallet);
-      if ("save" in res) {
-        // Аддитивно (см. buyPet): добавляем только купленный вид, не затирая локальный прогресс.
-        const sp = ex.species;
-        setPet((p) => {
-          if (!p) return hydrateSave(res.save);
-          if (p.ownedSpecies.includes(sp)) return p;
-          const prog = res.save.progress?.[sp] ?? { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: 1, buffs: [] };
-          const merged = {
-            ...p,
-            ownedSpecies: [...p.ownedSpecies, sp],
-            progress: { ...p.progress, [sp]: prog },
-            names: res.save.names?.[sp] ? { ...p.names, [sp]: res.save.names[sp] } : p.names,
-            updatedAt: Date.now(),
-          };
-          if (wallet) saveCloudSave(wallet, merged);
-          return merged;
-        });
-        setToast(`✨ Bought exclusive ${label}!`);
-        fetchExclusives().then(setExclusives);
-      } else {
-        setToast(res.error.includes("refund") ? `Couldn't complete — your SOL will be refunded (${res.error.replace(" — refund queued", "")})` : `Paid, but grant failed: ${res.error}`);
-      }
+      await processPurchase({ kind: "exclusive", sig, refId: ex.id, species: ex.species, label, ts: Date.now() });
     } catch {
       setToast("Purchase failed");
     }
@@ -1060,14 +1207,20 @@ export default function App() {
 
   const pickedInfo = PETS.find((p) => p.id === picked);
   // Базовые (обычные) питомцы не умирают — экран смерти только для rare+ питомцев.
-  const dead = !!pet && pet.stats.health <= 0 && !isBasePet(pet.species);
-  const reviveCost = pet ? reviveCostFor(pet.level) : 0;
+  // Смерть теперь возможна у ВСЕХ (включая базовых — от голода). Мёртвый пет заморожен → экран воскрешения.
+  const dead = !!pet && pet.stats.health <= 0;
+  const reviveCost = pet ? reviveCostFor(pet.level, pet.species) : 0;
+  // Все питомцы игрока мертвы → аварийное БЕСПЛАТНОЕ воскрешение одного на выбор (иначе soft-lock).
+  // Здоровье активного вида в pet.stats, остальных — в progress. Нет записи (не гидратирован) = считаем живым.
+  const allDead = !!pet && pet.ownedSpecies.length > 0 && pet.ownedSpecies.every((sp) => (sp === pet.species ? pet.stats.health : (pet.progress[sp]?.stats.health ?? 100)) <= 0);
   const cap = pet ? statCap(pet.level) : 100; // макс fullness/happiness (растёт с уровнем)
   // Питомцы игрока уровня BREED_LEVEL+ — кандидаты в родители для скрещивания.
   const breedEligible = pet ? pet.ownedSpecies.filter((id) => petLevel(id) >= BREED_LEVEL) : [];
   // Активные эффекты зелий (для показа ставки Sil/мин и силы арены).
   const potEff = pet ? potionEffects(pet.potions, Date.now()) : { sil: 0, power: 0, decay: 0, xp: 0, daily: 0 };
-  const silPerMin = pet ? silRate(pet.accessories, pet.species) * (1 + potEff.sil) * levelSilMult(pet.level) : 0;
+  // Пассив теперь серверный: база × множитель уровня (капнут ×3), без бонусов аксессуаров/зелий.
+  const silMult = pet ? Math.min(levelSilMult(pet.level), 3) : 1;
+  const silPerMin = pet ? BASE_SIL_PER_MIN * silMult : 0;
   // Прогресс квеста по его метрике (выводится из полей сейва).
   function questValue(metric: string): number {
     if (!pet) return 0;
@@ -1176,7 +1329,7 @@ export default function App() {
             )}
           </div>
           {pet && (
-            <span className="balance-pill" title={`+${+silPerMin.toFixed(2)} ${SIL}/min passive · Lv ${pet.level} ×${levelSilMult(pet.level).toFixed(1)}`}>
+            <span className="balance-pill" title={`+${+silPerMin.toFixed(2)} ${SIL}/min passive · Lv ${pet.level} ×${silMult.toFixed(1)}`}>
               <Coin />
               <span className="balance-amt">{Math.floor(pet.coins).toLocaleString()}</span>
               <span className="balance-cur">{SIL}</span>
@@ -1253,6 +1406,23 @@ export default function App() {
                     {pet.coins >= reviveCost ? `💊 Revive ${pet.name}` : `Need ${reviveCost} ${SIL}`}
                   </button>
                 </div>
+                {allDead && (
+                  // Все питомцы мертвы — аварийное бесплатное воскрешение одного на выбор (уровень −1).
+                  <div className="death-revive" style={{ marginTop: 12 }}>
+                    <span className="death-cost">💖 All pets fainted — revive one for FREE (level −1)</span>
+                    <div className="actions" style={{ flexWrap: "wrap", justifyContent: "center" }}>
+                      {pet.ownedSpecies.map((sp) => {
+                        const info = PETS.find((p) => p.id === sp)!;
+                        const lvl = sp === pet.species ? pet.level : (pet.progress[sp]?.level ?? 1);
+                        return (
+                          <button key={sp} className="btn btn-secondary" onClick={() => freeReviveAll(sp)}>
+                            {info.emoji} {pet.names[sp] ?? info.label} → Lv {Math.max(1, lvl - 1)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
                 <div className="actions">
                   <button className="btn btn-secondary" onClick={() => setModal("shop")}>🛒 Shop</button>
                   <button className="btn btn-secondary" onClick={() => setModal("pets")}>🔄 Switch pet</button>
@@ -1645,14 +1815,15 @@ export default function App() {
         const inTop = myRank > 0;
         const reward = inTop ? runRewardForRank(myRank) : pet.bestScore > 0 ? 50 : 0;
         const left = pet.lastRunReward + RUN_REWARD_COOLDOWN - Date.now();
-        const canReward = realMode ? !!wallet && pet.bestScore > 0 : pet.bestScore > 0;
+        const canReward = realMode ? rewardsUnlocked && pet.bestScore > 0 : pet.bestScore > 0;
         const rewardReady = canReward && left <= 0;
         const showMyRow = realMode && !!wallet && pet.bestScore > 0 && !inTop; // в игре, но не в топ-20
-        function claimRunReward() {
+        async function claimRunReward() {
           if (!rewardReady) return;
-          addCoins(reward);
-          setPet((p) => (p ? { ...p, lastRunReward: Date.now(), updatedAt: Date.now() } : p));
-          setToast(`🏆 Run reward${inTop ? ` (rank #${myRank})` : ""}: +${reward} ${SIL}`);
+          const res = await pvRunReward(myRank || 999); // сервер начисляет по рангу (кулдаун серверный)
+          if ("error" in res) { if (typeof res.coins === "number") setCoins(res.coins); return setToast(res.error.includes("10+") ? "🏆 Run rewards unlock at 10+ players" : "Reward not ready yet"); }
+          setPet((p) => (p ? { ...p, coins: res.coins, lastRunReward: Date.now(), updatedAt: Date.now() } : p));
+          setToast(`🏆 Run reward${inTop ? ` (rank #${myRank})` : ""}: +${res.credited} ${SIL}`);
         }
         const hh = Math.max(0, Math.floor(left / 3_600_000));
         const mm = Math.max(0, Math.floor((left % 3_600_000) / 60_000));
@@ -1709,7 +1880,15 @@ export default function App() {
 
       {/* ===== Sil Roulette ===== */}
       {modal === "roulette" && pet && (
-        <Roulette coins={pet.coins} onClose={() => setModal(null)} addCoins={addCoins} />
+        <Roulette
+          coins={pet.coins}
+          onClose={() => setModal(null)}
+          play={async (stake, bet) => {
+            const r = await pvRoulette(stake, bet); // сервер решает исход и меняет баланс
+            if ("coins" in r && typeof r.coins === "number") setCoins(r.coins);
+            return r;
+          }}
+        />
       )}
 
       {/* ===== Play: rhythm mini-game ===== */}
@@ -1815,11 +1994,11 @@ export default function App() {
             {marketTab === "player" && (() => {
               const cloud = isCloudEnabled();
               const loading = cloud && !marketLoaded;
-              type Row = { id: string; species: string; level: number; price: number; buffs: { kind: BuffKind; expiresAt: number }[]; seller: string; mine: boolean };
+              type Row = { id: string; species: string; level: number; price: number; buffs: { kind: BuffKind; expiresAt: number }[]; accessories: string[]; seller: string; mine: boolean };
               // Общие лоты из Supabase (видны всем) или локальные (без облака — только свои).
               const listings: Row[] = cloud
-                ? (marketListings ?? []).map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs ?? [], seller: l.seller, mine: !!wallet && l.seller === wallet }))
-                : pet.listings.filter((l) => l.kind === "sale").map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs, seller: "you", mine: true }));
+                ? (marketListings ?? []).map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs ?? [], accessories: l.accessories ?? [], seller: l.seller, mine: !!wallet && l.seller === wallet }))
+                : pet.listings.filter((l) => l.kind === "sale").map((l) => ({ id: l.id, species: l.species, level: l.level, price: l.price, buffs: l.buffs, accessories: l.accessories ?? [], seller: "you", mine: true }));
               // Питомцев для листинга можно выставить только НЕактивных (активного продавать нельзя).
               const listable = pet.ownedSpecies.filter((id) => id !== pet.species);
               const netPct = (10000 - SOL_MARKET_FEE_BPS) / 100;
@@ -1867,13 +2046,18 @@ export default function App() {
                         const info = PETS.find((p) => p.id === l.species)!;
                         const activeBuffs = l.buffs.filter((b) => b.expiresAt > Date.now()).length;
                         const owned = !l.mine && !!pet && pet.ownedSpecies.includes(l.species);
+                        // Наведение показывает: редкость, PV/min (зависит только от уровня — сервер капит пассив)
+                        // и надетые на пета аксессуары (уходят покупателю вместе с петом).
+                        const pvMin = +(BASE_SIL_PER_MIN * Math.min(levelSilMult(l.level), 3)).toFixed(2);
+                        const accList = l.accessories.map((id) => accById(id)).filter((a): a is NonNullable<typeof a> => !!a);
+                        const tip = `${RARITY[info.rarity].label} · ~${pvMin} ${SIL}/min · ${accList.length ? accList.map((a) => `${a.emoji} ${a.label}`).join(", ") : "No accessories"}`;
                         return (
-                          <div key={l.id} className="inv-item inv-item-tall market-listing">
+                          <div key={l.id} className="inv-item inv-item-tall market-listing" title={tip}>
                             {l.mine && <button className="mini-x" onClick={() => cancelListing(l.id)} title="Cancel listing">✕</button>}
                             <span className="rar-dot" style={{ background: RARITY[info.rarity].color }} />
                             <span className="inv-emoji"><PetArt species={l.species} size={34} /></span>
                             <span className="inv-name">{info.label}</span>
-                            <span className="inv-perk">Lv {l.level}{activeBuffs ? ` · ✨${activeBuffs}` : ""}</span>
+                            <span className="inv-perk">Lv {l.level}{activeBuffs ? ` · ✨${activeBuffs}` : ""}{accList.length ? ` · ${accList.map((a) => a.emoji).join("")}` : ""}</span>
                             <span className="inv-feed">◎ {l.price}</span>
                             {l.mine ? (
                               <span className="market-seller">your listing</span>
@@ -2320,7 +2504,7 @@ export default function App() {
               {previewData.pool.map((i) => (
                 <div className="inv-item preview-item" key={i.id} title={chestItemTitle(i)}>
                   <span className="rar-dot" style={{ background: RARITY[i.rarity].color }} />
-                  <span className="inv-emoji">{i.emoji}</span>
+                  <span className="inv-emoji">{preview.kind === "pet" ? <PetArt species={i.id} size={30} /> : i.emoji}</span>
                   <span className="inv-name">{i.label}</span>
                   <span className="pchance" style={{ color: RARITY[i.rarity].color }}>{fmtChance(previewData.chanceOf(i))}</span>
                 </div>

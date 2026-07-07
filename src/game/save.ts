@@ -1,6 +1,6 @@
 import { type PetId, isBasePet } from "./pets";
 import { type BuffKind } from "./buffs";
-import { type Stats, clamp, decay, decayMult, statCap, START_COINS, GRANT_V } from "./mechanics";
+import { type Stats, clamp, decay, decayMult, decayInactive, statCap, START_COINS, GRANT_V } from "./mechanics";
 import { mythicAcc, STARTER_ACCESSORIES } from "./accessories";
 import { type ActivePotion } from "./potions";
 
@@ -14,6 +14,7 @@ export type MarketListing = {
   species: string;
   level: number;
   buffs: { kind: BuffKind; expiresAt: number }[];
+  accessories?: string[]; // аксессуары, надетые на выставленного пета (уходят покупателю при продаже)
   price: number; // SOL: фикс-цена (sale) или стартовая ставка (auction)
   createdAt: number;
 };
@@ -38,8 +39,9 @@ export type SavedPet = {
   questClaimed: string[]; // id скрытых (закрытых крестиком) квестов
   questDone: string[]; // id забранных квестов (награда запрошена) — показываются перечёркнутыми
   listings: MarketListing[]; // выставленные игроком лоты (продажа/аукцион)
-  // Сохранённый прогресс НЕактивных питомцев (активный живёт в полях выше).
-  progress: Record<string, { stats: Stats; xp: number; level: number; buffs: { kind: BuffKind; expiresAt: number }[] }>;
+  // Сохранённый прогресс НЕактивных питомцев (активный живёт в полях выше). accessories — надетые на
+  // каждого неактивного пета аксессуары (остаются на нём при переключении, уходят при продаже).
+  progress: Record<string, { stats: Stats; xp: number; level: number; buffs: { kind: BuffKind; expiresAt: number }[]; accessories?: string[] }>;
   lastDaily: number;
   totalScore: number; // суммарные очки за все игры Play (накопительно, для показа в углу)
   bestScore: number; // лучший счёт за один заход (для лидерборда)
@@ -65,14 +67,14 @@ export function loadPet(): SavedPet | null {
     const hours = (now - p.updatedAt) / 3_600_000;
     const mr = mythicAcc(accessories);
     let stats: Stats;
-    // Мёртвый питомец заморожен — НО базовые питомцы не умирают, поэтому у них
-    // распад/восстановление продолжается как обычно даже при 0 HP.
-    if (p.stats.health <= 0 && !isBasePet(p.species)) {
+    // Мёртвый питомец заморожен (health = 0) — оживить лекарством. Теперь это касается ВСЕХ, включая
+    // базовых: базовый пет умирает, если его не кормить (starveOnly), и тоже замерзает при смерти.
+    if (p.stats.health <= 0) {
       stats = p.stats;
     } else {
       // Распад за закрытый период, затем mythic-регенерация (но без оффлайн-Sil/XP).
       const cap = statCap(p.level ?? 1);
-      stats = decay(p.stats, p.updatedAt, now, decayMult(buffs, accessories, p.species, now), cap);
+      stats = decay(p.stats, p.updatedAt, now, decayMult(buffs, accessories, p.species, now), cap, 1, isBasePet(p.species));
       stats = { ...stats, fullness: clamp(stats.fullness + mr.fRegen * hours, cap), happiness: clamp(stats.happiness + mr.hRegen * hours, cap) };
     }
     return {
@@ -95,7 +97,7 @@ export function loadPet(): SavedPet | null {
       questClaimed: p.questClaimed ?? [],
       questDone: p.questDone ?? [],
       listings: p.listings ?? [],
-      progress: p.progress ?? {},
+      progress: decayInactive(p.progress ?? {}, p.updatedAt, now), // неактивные питомцы распадаются в 10× медленнее
       lastDaily: p.lastDaily ?? 0,
       totalScore: p.totalScore ?? 0,
       bestScore: p.bestScore ?? 0,

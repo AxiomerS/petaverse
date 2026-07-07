@@ -20,6 +20,22 @@ function jsonResp(body: unknown, status = 200): Response {
 function sbHeaders(extra?: Record<string, string>) {
   return { apikey: SERVICE, Authorization: `Bearer ${SERVICE}`, "Content-Type": "application/json", ...extra };
 }
+// Вызвать атомарную SQL-функцию баланса. Возвращает новый баланс или null.
+async function rpcNum(fn: string, args: Record<string, unknown>): Promise<number | null> {
+  const res = await fetch(`${SB_URL}/rest/v1/rpc/${fn}`, { method: "POST", headers: sbHeaders(), body: JSON.stringify(args) });
+  const data = await res.json().catch(() => null);
+  const v = Array.isArray(data) ? data[0] : data;
+  const n = Number(v);
+  return v === null || v === undefined || !Number.isFinite(n) ? null : n;
+}
+// Гарантировать строку баланса (ленивый бэкфилл из сейва) — чтобы атомарный UPDATE нашёл что менять.
+async function ensureBalanceRow(wallet: string): Promise<void> {
+  const brows = await fetch(`${SB_URL}/rest/v1/balances?wallet=eq.${encodeURIComponent(wallet)}&select=wallet`, { headers: sbHeaders() }).then((r) => r.json());
+  if (brows?.[0]) return;
+  const sRows = await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}&select=data`, { headers: sbHeaders() }).then((r) => r.json());
+  const coins = Math.floor(Number(sRows?.[0]?.data?.coins ?? 0)) || 0;
+  await fetch(`${SB_URL}/rest/v1/balances`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal,resolution=merge-duplicates" }), body: JSON.stringify({ wallet, coins, last_collect: Date.now(), updated_at: new Date().toISOString() }) });
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
@@ -60,18 +76,12 @@ Deno.serve(async (req) => {
     if (rec.status === 409) return jsonResp({ error: "already processed" }, 409);
     if (!rec.ok) return jsonResp({ error: "record failed" }, 500);
 
-    // 4) Начисляем PV в сейв игрока (read-modify-write через service_role).
-    const rows = await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}&select=data`, { headers: sbHeaders() }).then((r) => r.json());
-    const data = rows?.[0]?.data;
-    if (!data) return jsonResp({ error: "no save yet — play a bit first" }, 400);
-    const coins = Math.floor((data.coins ?? 0) + pv);
-    await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}`, {
-      method: "PATCH",
-      headers: sbHeaders({ Prefer: "return=minimal" }),
-      body: JSON.stringify({ data: { ...data, coins }, updated_at: new Date().toISOString() }),
-    });
+    // 4) Начисляем PV в СЕРВЕРНЫЙ баланс АТОМАРНО (pv_add_checked: UPDATE ... SET coins=coins+pv RETURNING).
+    //    Так параллельные покупки/начисления не затирают друг друга (без lost-update). Строку гарантируем заранее.
+    await ensureBalanceRow(wallet);
+    const coins = await rpcNum("pv_add_checked", { p_wallet: wallet, p_delta: pv, p_min: 0 });
 
-    return jsonResp({ ok: true, credited: pv, coins });
+    return jsonResp({ ok: true, credited: pv, coins: coins ?? pv });
   } catch (e) {
     return jsonResp({ error: String(e) }, 500);
   }

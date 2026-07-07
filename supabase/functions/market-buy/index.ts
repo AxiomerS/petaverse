@@ -23,12 +23,14 @@ function sbHeaders(extra?: Record<string, string>) {
   return { apikey: SERVICE, Authorization: `Bearer ${SERVICE}`, "Content-Type": "application/json", ...extra };
 }
 
-// Выдать вид питомца в сейв покупателя (ownedSpecies + progress + имя). Возвращает false, если уже владеет.
-function grantPet(data: any, species: string, level: number, buffs: unknown, name?: string): boolean {
+// Выдать вид питомца в сейв покупателя (ownedSpecies + progress + имя + надетые аксессуары).
+// Аксессуары уходят вместе с петом: кладём их и в ownedAccessories, и в progress[species].accessories.
+function grantPet(data: any, species: string, level: number, buffs: unknown, name?: string, accessories: string[] = []): boolean {
   const owned: string[] = data.ownedSpecies ?? [];
   if (owned.includes(species)) return false; // модель: один экземпляр на вид
   data.ownedSpecies = [...owned, species];
-  data.progress = { ...(data.progress ?? {}), [species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: level || 1, buffs: buffs ?? [] } };
+  data.progress = { ...(data.progress ?? {}), [species]: { stats: { fullness: 100, happiness: 100, health: 100 }, xp: 0, level: level || 1, buffs: buffs ?? [], accessories } };
+  if (accessories.length) data.ownedAccessories = Array.from(new Set([...(data.ownedAccessories ?? []), ...accessories]));
   if (name) data.names = { ...(data.names ?? {}), [species]: name };
   return true;
 }
@@ -100,6 +102,7 @@ Deno.serve(async (req) => {
     let species: string;
     let level = 1;
     let buffs: unknown = [];
+    let accessories: string[] = [];
     let name: string | undefined;
 
     if (type === "sale") {
@@ -139,6 +142,7 @@ Deno.serve(async (req) => {
       species = lot.species;
       level = lot.level ?? 1;
       buffs = lot.buffs ?? [];
+      accessories = Array.isArray(lot.accessories) ? lot.accessories : [];
       name = lot.name || undefined;
       seller = lot.seller;
     } else {
@@ -152,8 +156,15 @@ Deno.serve(async (req) => {
     }
 
     // 6) Выдаём пета покупателю (владение уже проверено на шаге 4).
-    grantPet(buyer, species, level, buffs, name);
+    //    Авторитет — pet_ledger (Phase 2): пишем туда через service_role. saves.data — лишь зеркало.
+    //    Продавец уже лишился пета в леджере при выставлении лота (edge fn pets → pet_take).
+    grantPet(buyer, species, level, buffs, name, accessories);
     await writeSave(wallet, buyer);
+    await fetch(`${SB_URL}/rest/v1/rpc/pet_grant`, {
+      method: "POST",
+      headers: sbHeaders(),
+      body: JSON.stringify({ p_wallet: wallet, p_species: species, p_level: level, p_buffs: buffs ?? [], p_name: name ?? null, p_source: type === "exclusive" ? "exclusive" : "market" }),
+    }).catch(() => {});
 
     // 7) Продажа между игроками → заявка продавцу на выплату (минус комиссия казны). Ретрай при сбое
     //    (id — PK, поэтому повторная удачная вставка = 409, считаем успехом → без двойной выплаты).

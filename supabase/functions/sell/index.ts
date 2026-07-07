@@ -18,6 +18,22 @@ function jsonResp(body: unknown, status = 200): Response {
 function sbHeaders(extra?: Record<string, string>) {
   return { apikey: SERVICE, Authorization: `Bearer ${SERVICE}`, "Content-Type": "application/json", ...extra };
 }
+// Вызвать атомарную SQL-функцию баланса (pv_spend / pv_add_checked). Возвращает новый баланс или null.
+async function rpcNum(fn: string, args: Record<string, unknown>): Promise<number | null> {
+  const res = await fetch(`${SB_URL}/rest/v1/rpc/${fn}`, { method: "POST", headers: sbHeaders(), body: JSON.stringify(args) });
+  const data = await res.json().catch(() => null);
+  const v = Array.isArray(data) ? data[0] : data;
+  const n = Number(v);
+  return v === null || v === undefined || !Number.isFinite(n) ? null : n;
+}
+// Гарантировать строку баланса (ленивый бэкфилл из сейва) — чтобы атомарный UPDATE нашёл что менять.
+async function ensureBalanceRow(wallet: string): Promise<void> {
+  const brows = await fetch(`${SB_URL}/rest/v1/balances?wallet=eq.${encodeURIComponent(wallet)}&select=wallet`, { headers: sbHeaders() }).then((r) => r.json());
+  if (brows?.[0]) return;
+  const sRows = await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}&select=data`, { headers: sbHeaders() }).then((r) => r.json());
+  const coins = Math.floor(Number(sRows?.[0]?.data?.coins ?? 0)) || 0;
+  await fetch(`${SB_URL}/rest/v1/balances`, { method: "POST", headers: sbHeaders({ Prefer: "return=minimal,resolution=merge-duplicates" }), body: JSON.stringify({ wallet, coins, last_collect: Date.now(), updated_at: new Date().toISOString() }) });
+}
 function b64urlToBytes(s: string): Uint8Array {
   s = s.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
@@ -47,24 +63,16 @@ Deno.serve(async (req) => {
     const { pv } = await req.json();
     if (!Number.isFinite(pv) || pv <= 0) return jsonResp({ error: "bad amount" }, 400);
 
-    // Читаем сейв и проверяем баланс.
-    const rows = await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}&select=data`, { headers: sbHeaders() }).then((r) => r.json());
-    const data = rows?.[0]?.data;
-    if (!data) return jsonResp({ error: "no save" }, 400);
-    const coins = Math.floor(data.coins ?? 0);
-    if (coins < pv) return jsonResp({ error: "not enough PV" }, 400);
+    // АТОМАРНОЕ списание: гарантируем строку баланса, затем pv_spend (UPDATE ... WHERE coins >= pv
+    // RETURNING). Так два одновременных запроса на продажу НЕ спишут PV дважды и не создадут двойную
+    // выплату (double-spend → кража SOL из казны). null = не хватило PV.
+    await ensureBalanceRow(wallet);
+    const newCoins = await rpcNum("pv_spend", { p_wallet: wallet, p_amount: pv });
+    if (newCoins === null) return jsonResp({ error: "not enough PV" }, 400);
 
     const sol = +(pv / RATE).toFixed(6);
-    const newCoins = coins - pv;
 
-    // Списываем PV (держим до одобрения).
-    await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}`, {
-      method: "PATCH",
-      headers: sbHeaders({ Prefer: "return=minimal" }),
-      body: JSON.stringify({ data: { ...data, coins: newCoins }, updated_at: new Date().toISOString() }),
-    });
-
-    // Создаём заявку.
+    // Создаём заявку. Если не удалось — АТОМАРНО возвращаем удержанные PV.
     const id = `s${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
     const rec = await fetch(`${SB_URL}/rest/v1/sell_requests`, {
       method: "POST",
@@ -72,12 +80,7 @@ Deno.serve(async (req) => {
       body: JSON.stringify({ id, wallet, pv, sol, status: "pending", created_at: new Date().toISOString() }),
     });
     if (!rec.ok) {
-      // откат списания, если заявку не создали
-      await fetch(`${SB_URL}/rest/v1/saves?wallet=eq.${encodeURIComponent(wallet)}`, {
-        method: "PATCH",
-        headers: sbHeaders({ Prefer: "return=minimal" }),
-        body: JSON.stringify({ data: { ...data, coins }, updated_at: new Date().toISOString() }),
-      });
+      await rpcNum("pv_add_checked", { p_wallet: wallet, p_delta: pv, p_min: 0 }); // вернуть удержанные PV
       return jsonResp({ error: "request failed (sell_requests table?)" }, 500);
     }
 

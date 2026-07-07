@@ -23,9 +23,9 @@ function headers(extra?: Record<string, string>): Record<string, string> {
   return { apikey: KEY!, Authorization: `Bearer ${sessionToken ?? KEY!}`, "Content-Type": "application/json", ...extra };
 }
 
-// Подтвердить покупку: серверная функция проверит транзакцию в блокчейне и начислит PV.
-// Возвращает новый баланс coins или null.
-export async function confirmPurchase(wallet: string, signature: string): Promise<{ coins: number; credited: number } | { error: string }> {
+// Подтвердить покупку PV: серверная функция проверит транзакцию в блокчейне и начислит PV.
+// notFound (404/сеть) = tx ещё не видна → повторить позже; already (409) = уже зачислено.
+export async function confirmPurchase(wallet: string, signature: string): Promise<{ coins: number; credited: number } | { error: string; notFound?: boolean; already?: boolean }> {
   if (!isCloudEnabled()) return { error: "cloud off" };
   try {
     const res = await fetch(`${URL}/functions/v1/buy`, {
@@ -35,9 +35,9 @@ export async function confirmPurchase(wallet: string, signature: string): Promis
     });
     const data = (await res.json().catch(() => ({}))) as { coins?: number; credited?: number; error?: string };
     if (res.ok && typeof data.coins === "number") return { coins: data.coins, credited: data.credited ?? 0 };
-    return { error: data.error ?? `HTTP ${res.status}` };
+    return { error: data.error ?? `HTTP ${res.status}`, notFound: res.status === 404, already: res.status === 409 };
   } catch (e) {
-    return { error: String(e) };
+    return { error: String(e), notFound: true }; // сетевой сбой → тоже повторяемо
   }
 }
 
@@ -243,6 +243,7 @@ export type Listing = {
   species: string;
   level: number;
   buffs: { kind: BuffKind; expiresAt: number }[];
+  accessories?: string[]; // аксессуары, надетые на выставленного пета (переходят покупателю)
   price: number;
   name?: string;
   created_at?: string;
@@ -294,7 +295,7 @@ export async function deleteListing(id: string, seller: string): Promise<Listing
 // ===== Покупка на маркете (реальный SOL) — серверная функция проверяет tx и проводит сделку =====
 // type 'sale' — купить лот игрока (refId = listing.id); 'exclusive' — купить эксклюзив (refId = exclusive.id).
 // Возвращает обновлённый сейв покупателя (для setPet) или ошибку.
-export async function confirmMarketBuy(type: "sale" | "exclusive", refId: string, signature: string, wallet: string): Promise<{ save: SavedPet } | { error: string }> {
+export async function confirmMarketBuy(type: "sale" | "exclusive", refId: string, signature: string, wallet: string): Promise<{ save: SavedPet } | { error: string; notFound?: boolean; refund?: boolean }> {
   if (!isCloudEnabled()) return { error: "cloud off" };
   try {
     const res = await fetch(`${URL}/functions/v1/market-buy`, {
@@ -302,11 +303,12 @@ export async function confirmMarketBuy(type: "sale" | "exclusive", refId: string
       headers: headers(),
       body: JSON.stringify({ wallet, signature, type, refId }),
     });
-    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; save?: SavedPet; error?: string };
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; save?: SavedPet; error?: string; refund?: boolean };
     if (res.ok && data.ok && data.save) return { save: data.save };
-    return { error: data.error ?? `HTTP ${res.status}` };
+    // 404 = tx ещё не видна → повторить; иначе сделка завершена (уже обработано / оформлен возврат).
+    return { error: data.error ?? `HTTP ${res.status}`, notFound: res.status === 404, refund: !!data.refund };
   } catch (e) {
-    return { error: String(e) };
+    return { error: String(e), notFound: true }; // сетевой сбой → повторяемо
   }
 }
 
@@ -349,6 +351,105 @@ export async function deleteExclusive(id: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// ===== Серверный баланс PV (edge fn "pv") — единственный источник правды по PV =====
+// Все начисления/траты идут сюда; ответ содержит авторитетный coins, которым обновляем зеркало на клиенте.
+async function pvCall(action: string, extra: Record<string, unknown> = {}): Promise<any> {
+  if (!isCloudEnabled()) return { error: "cloud off" };
+  try {
+    const res = await fetch(`${URL}/functions/v1/pv`, { method: "POST", headers: headers(), body: JSON.stringify({ action, ...extra }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { error: data.error ?? `HTTP ${res.status}`, coins: data.coins };
+    return data;
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+// Синхронизация: начислить пассив и вернуть авторитетный баланс. null — облако/кошелёк недоступны.
+export async function pvSync(level: number): Promise<{ coins: number; lastDaily: number } | null> {
+  const d = await pvCall("sync", { level });
+  return typeof d.coins === "number" ? { coins: d.coins, lastDaily: d.lastDaily ?? 0 } : null;
+}
+// Забрать дейли. Возвращает новый баланс или ошибку.
+export async function pvDaily(): Promise<{ coins: number; credited: number } | { error: string; coins?: number }> {
+  const d = await pvCall("daily");
+  return "error" in d ? d : { coins: d.coins, credited: d.credited ?? 0 };
+}
+// Списать PV за покупку (магазин/сундук/разведение/воскрешение/зелье). Проверка баланса — на сервере.
+export async function pvSpend(amount: number): Promise<{ coins: number } | { error: string; coins?: number }> {
+  const d = await pvCall("spend", { amount });
+  return "error" in d ? d : { coins: d.coins };
+}
+// Рулетка: сервер списывает ставку, крутит RNG, начисляет выигрыш. Возвращает исход для анимации.
+export async function pvRoulette(stake: number, bet: "red" | "black" | "zero"): Promise<{ coins: number; win: boolean; n: number; color: string } | { error: string; coins?: number }> {
+  const d = await pvCall("roulette", { stake, bet });
+  return "error" in d ? d : { coins: d.coins, win: !!d.win, n: d.n, color: d.color };
+}
+// Итог боя арены: сервер меняет баланс (ставка + капнутая награда). won доверяем (Phase 1).
+export async function pvBattle(stake: number, won: boolean, level: number): Promise<{ coins: number; locked?: boolean } | { error: string; coins?: number }> {
+  const d = await pvCall("battle", { stake, won, level });
+  return "error" in d ? d : { coins: d.coins, locked: !!d.locked };
+}
+// Награда за топ лидерборда (по рангу, с серверным кулдауном).
+export async function pvRunReward(rank: number): Promise<{ coins: number; credited: number } | { error: string; coins?: number }> {
+  const d = await pvCall("run-reward", { rank });
+  return "error" in d ? d : { coins: d.coins, credited: d.credited ?? 0 };
+}
+
+// ===== Серверное владение питомцами (edge fn "pets" + таблица public.pet_ledger, Phase 2) =====
+// pet_ledger — единственный источник правды по владению. Клиент читает свою строку (RLS read-own);
+// выдача/продажа идут через edge fn (сервер проверяет и пишет service_role). save.ownedSpecies — зеркало.
+export type LedgerPet = { species: string; level: number; buffs: { kind: BuffKind; expiresAt: number }[]; name?: string | null };
+
+// Прочитать своих питомцев из леджера (авторитетный список владения). null — облако/кошелёк недоступны.
+export async function petsSync(): Promise<LedgerPet[] | null> {
+  if (!isCloudEnabled() || !sessionToken) return null;
+  try {
+    const res = await fetch(`${URL}/rest/v1/pet_ledger?select=species,level,buffs,name`, { headers: headers() });
+    if (!res.ok) return null;
+    return (await res.json()) as LedgerPet[];
+  } catch {
+    return null;
+  }
+}
+
+async function petsCall(action: string, extra: Record<string, unknown> = {}): Promise<any> {
+  if (!isCloudEnabled()) return { error: "cloud off" };
+  try {
+    const res = await fetch(`${URL}/functions/v1/pets`, { method: "POST", headers: headers(), body: JSON.stringify({ action, ...extra }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { error: data.error ?? `HTTP ${res.status}`, coins: data.coins };
+    return data;
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+// Выдать стартового (бесплатного) питомца в леджер при создании аккаунта.
+export async function petsStarter(species: string, name: string): Promise<boolean> {
+  const d = await petsCall("starter", { species, name });
+  return !("error" in d);
+}
+// Открыть сундук питомца: сервер решает вид, списывает PV, выдаёт в леджер. active — активный вид (для скидки).
+export async function petsChest(chestId: string, active: string): Promise<{ coins: number; species: string; rarity: string } | { error: string; coins?: number }> {
+  const d = await petsCall("chest", { chestId, active });
+  return "error" in d ? d : { coins: d.coins, species: d.species, rarity: d.rarity };
+}
+// Скрестить двух своих питомцев (проверка родителей — на сервере по леджеру).
+export async function petsBreed(parents: string[]): Promise<{ coins: number; species: string; rarity: string } | { error: string; coins?: number }> {
+  const d = await petsCall("breed", { parents });
+  return "error" in d ? d : { coins: d.coins, species: d.species, rarity: d.rarity };
+}
+// Выставить пета на продажу: сервер забирает его из леджера (эскроу) и создаёт лот. accessories — надетые
+// на пета аксессуары (уходят покупателю). Возвращает лот или ошибку.
+export async function petsList(species: string, price: number, level: number, buffs: unknown, name: string, accessories: string[]): Promise<{ listing: Listing } | { error: string }> {
+  const d = await petsCall("list", { species, price, level, buffs, name, accessories });
+  return "error" in d ? d : { listing: d.listing as Listing };
+}
+// Снять свой лот: сервер удаляет лот и возвращает пета (с аксессуарами) в леджер. restored=false → лот уже куплен.
+export async function petsCancel(id: string): Promise<{ restored: boolean; species?: string; level?: number; buffs?: { kind: BuffKind; expiresAt: number }[]; accessories?: string[]; name?: string | null } | { error: string }> {
+  const d = await petsCall("cancel", { id });
+  return "error" in d ? d : { restored: !!d.restored, species: d.species, level: d.level, buffs: d.buffs, accessories: d.accessories, name: d.name };
 }
 
 // ===== Заявки на награды за квесты (таблица public.quest_claims) — выплата SOL вручную админом =====

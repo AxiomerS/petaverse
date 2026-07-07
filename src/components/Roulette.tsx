@@ -28,59 +28,43 @@ function slicePath(k: number, r: number) {
   const p1 = pt(r, (k + 1) * SEG);
   return `M 100 100 L ${p0.x.toFixed(2)} ${p0.y.toFixed(2)} A ${r} ${r} 0 0 1 ${p1.x.toFixed(2)} ${p1.y.toFixed(2)} Z`;
 }
-// Индексы карманов, удовлетворяющих условию.
-function indicesWhere(f: (p: { n: number; color: PocketColor }) => boolean): number[] {
-  const out: number[] = [];
-  POCKETS.forEach((p, i) => { if (f(p)) out.push(i); });
-  return out;
-}
 
 type Bet = "zero" | "red" | "black";
+// Исход рулетки решает СЕРВЕР (edge fn pv): списывает ставку, крутит RNG, начисляет выигрыш.
+type SpinResult = { coins: number; win: boolean; n: number; color: string } | { error: string; coins?: number };
 
-export function Roulette({ coins, onClose, addCoins }: { coins: number; onClose: () => void; addCoins: (delta: number) => void }) {
+export function Roulette({ coins, onClose, play }: { coins: number; onClose: () => void; play: (stake: number, bet: Bet) => Promise<SpinResult> }) {
   const [stake, setStake] = useState<number | null>(null);
   const [rotation, setRotation] = useState(0);
   const [spinning, setSpinning] = useState(false);
   const [result, setResult] = useState<{ win: boolean; text: string } | null>(null);
 
-  function spin(bet: Bet) {
+  async function spin(bet: Bet) {
     if (spinning || stake == null || coins < stake) return;
-    addCoins(-stake); // списываем ставку сразу
     setResult(null);
     setSpinning(true);
-
-    // Сначала решаем исход по заданным шансам, затем подбираем карман для анимации.
-    let win: boolean;
-    let pool: number[];
-    if (bet === "zero") {
-      win = Math.random() < 1 / 36;
-      pool = win ? indicesWhere((p) => p.n === 0) : indicesWhere((p) => p.n !== 0);
-    } else {
-      win = Math.random() < 1 / 2;
-      pool = win ? indicesWhere((p) => p.color === bet) : indicesWhere((p) => p.color !== bet);
+    // Сервер решает исход и меняет баланс; получаем номер кармана для анимации.
+    const res = await play(stake, bet);
+    if ("error" in res) {
+      setSpinning(false);
+      setResult({ win: false, text: res.error === "not enough PV" ? "Not enough PV" : "Spin failed — try again" });
+      return;
     }
-    const k = pool[Math.floor(Math.random() * pool.length)];
-    const pocket = POCKETS[k];
-
+    const k = Math.max(0, POCKETS.findIndex((p) => p.n === res.n));
     playSpinSound(SPIN_MS / 1000);
-
     // Докрутить так, чтобы центр кармана k встал под стрелку сверху, плюс 6 полных оборотов.
     const center = k * SEG + SEG / 2;
     const offset = (360 - (center % 360) + 360) % 360;
-    const jitter = (Math.random() * 0.6 - 0.3) * SEG; // лёгкий разброс внутри кармана
+    const jitter = (Math.random() * 0.6 - 0.3) * SEG;
     setRotation((prev) => Math.ceil(prev / 360) * 360 + 360 * 6 + offset + jitter);
-
-    const payout = win ? (bet === "zero" ? stake * 15 : stake * 2) : 0;
     window.setTimeout(() => {
-      if (win) addCoins(payout);
-      if (win) playWinSound();
+      if (res.win) playWinSound();
       else playLoseSound();
-      const net = payout - stake;
       setResult({
-        win,
-        text: win
-          ? `🎉 ${pocket.n} ${pocket.color} — you won +${net} PV!`
-          : `😬 ${pocket.n} ${pocket.color} — you lost ${stake} PV`,
+        win: res.win,
+        text: res.win
+          ? `🎉 ${res.n} ${res.color} — you won!`
+          : `😬 ${res.n} ${res.color} — you lost ${stake} PV`,
       });
       setSpinning(false);
     }, SPIN_MS);
