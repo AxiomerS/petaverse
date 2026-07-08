@@ -1742,7 +1742,28 @@ textarea {
   animation: bob 2.4s ease-in-out infinite;
   filter: drop-shadow(0 12px 16px rgba(0, 0, 0, 0.5));
 }
+/* Питомец на главном экране + мягкое свечение под ним по редкости вида. */
+.pet-stage {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+.pet-glow {
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  transform: translateX(-50%);
+  width: 100px;
+  height: 34px;
+  border-radius: 50%;
+  filter: blur(18px);
+  opacity: 0.32;
+  pointer-events: none;
+  z-index: 0;
+}
 .pet-emoji-btn {
+  position: relative;
+  z-index: 1;
   background: none;
   border: 0;
   padding: 0;

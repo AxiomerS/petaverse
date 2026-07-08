@@ -111,6 +111,8 @@ const PET_IMG: Record<string, string> = {
   penguin: "/penguin.png",
   owl: "/owl.png",
   lion: "/lion.png",
+  unicorn: "/unicorn.png",
+  dragon: "/dragon.png",
 };
 
 // Показать питомца: своя картинка → кастомный SVG → эмодзи (фолбэк).

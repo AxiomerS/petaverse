@@ -1475,9 +1475,12 @@ export default function App() {
               </div>
             ) : (
               <>
-                <button className="pet-emoji-big pet-emoji-btn" onClick={() => setPetMenu(true)} title={`Interact with ${pet.name}`}>
-                  <PetArt species={pet.species} size={110} />
-                </button>
+                <div className="pet-stage">
+                  <span className="pet-glow" style={{ background: RARITY[PETS.find((p) => p.id === pet.species)?.rarity ?? "common"].color }} />
+                  <button className="pet-emoji-big pet-emoji-btn" onClick={() => setPetMenu(true)} title={`Interact with ${pet.name}`}>
+                    <PetArt species={pet.species} size={110} />
+                  </button>
+                </div>
 
                 <div className="slots">
                   {SLOTS.map((s) => {
