@@ -471,6 +471,7 @@ export default function App() {
     const won = rollFood(c.odds);
     setReelOffset(0);
     const reel = buildStrip(FOODS, won);
+    playSpinSound(SPIN_MS / 1000); // играть звук РОВНО тогда, когда барабан реально начинает крутиться
     setChest({
       won: { emoji: won.emoji, label: won.label, rarity: won.rarity, rarityLabel: RARITY[won.rarity].label, rarityColor: RARITY[won.rarity].color },
       strip: reel.strip,
@@ -502,6 +503,7 @@ export default function App() {
     if (Math.floor(pet.coins) < cost) return setToast(`Not enough ${SIL}`);
     setReelOffset(0);
     const reel = buildStrip(ACCESSORIES, won);
+    playSpinSound(SPIN_MS / 1000); // играть звук РОВНО тогда, когда барабан реально начинает крутиться
     setChest({
       won: { emoji: won.emoji, label: won.label, rarity: won.rarity, rarityLabel: RARITY[won.rarity].label, rarityColor: RARITY[won.rarity].color },
       strip: reel.strip,
@@ -555,6 +557,7 @@ export default function App() {
     if (!won) return;
     setReelOffset(0);
     const reel = buildStrip(PETS, won);
+    playSpinSound(SPIN_MS / 1000); // играть звук РОВНО тогда, когда барабан реально начинает крутиться (после ответа сервера)
     setChest({
       won: { emoji: won.emoji, label: won.label, rarity: won.rarity, rarityLabel: RARITY[won.rarity].label, rarityColor: RARITY[won.rarity].color },
       strip: reel.strip,
@@ -566,9 +569,12 @@ export default function App() {
   }
 
   // Spin the previewed chest (pay + roll + animation), then close the preview.
+  // Звук крутки теперь запускается в openChest/openAccessoryChest/openPetChest — РЯДОМ с setChest(...),
+  // а не здесь. Раньше он стартовал тут сразу по клику: для петов ролл решает сервер (await petsChest),
+  // так что барабан начинал крутиться заметно позже звука; а если игрок уже владел всем (пет/аксессуар),
+  // открытие сундука сразу выходило до setChest — барабан не показывался вовсе, а звук уже успевал сыграть.
   function spinPreview() {
     if (!preview) return;
-    playSpinSound(SPIN_MS / 1000); // user gesture → audio allowed
     if (preview.kind === "food") openChest(preview.chest);
     else if (preview.kind === "accessory") openAccessoryChest(preview.chest);
     else openPetChest(preview.chest);
