@@ -59,7 +59,7 @@ const LINK_TWITTER = "https://x.com/PetaVerseSol";
 const LINK_PUMPFUN = "https://pump.fun/";
 const TOKEN_CA = ""; // адрес контракта токена; пусто = ещё не запущен
 
-// Реальная покупка PV за SOL — курс и пакеты заданы в game/pay.ts (devnet).
+// Реальная покупка PV за SOL — курс и пакеты заданы в game/pay.ts (mainnet).
 
 // Сессия верификации кошелька (JWT из auth-функции), хранится локально для бесшовного входа.
 const SESSION_KEY = "petaverse.session";
@@ -105,7 +105,9 @@ export default function App() {
   const [petNameInput, setPetNameInput] = useState("");
   const [petMenu, setPetMenu] = useState(false); // панель взаимодействия с питомцем
   const [showBuffs, setShowBuffs] = useState(false); // раскрыта ли панель баффов (когда их >2)
-  const [questsOpen, setQuestsOpen] = useState(true); // раскрыт ли список квестов
+  // раскрыт ли список квестов — на узких экранах (см. брейкпоинт 520px в App.css) по умолчанию свёрнут,
+  // иначе fixed-панель квестов перекрывает карточку питомца (нет места сбоку, как на десктопе).
+  const [questsOpen, setQuestsOpen] = useState(() => typeof window !== "undefined" && window.innerWidth > 520);
   const [wallet, setWallet] = useState<string | null>(null); // адрес подключённого кошелька Phantom (= ID игрока)
   const [walletMenu, setWalletMenu] = useState(false); // открыт ли попап кошелька
   const [cloudLoading, setCloudLoading] = useState(false); // идёт ли загрузка облачного сейва
@@ -1970,7 +1972,7 @@ export default function App() {
               <h3>🛍️ Marketplace</h3>
               <span className="coins">◎ {pet.sol} SOL</span>
             </div>
-            <p className="subtitle" style={{ marginTop: -4 }}>Buy and sell pets for real <b>SOL</b> — paid straight from your Phantom wallet (devnet).</p>
+            <p className="subtitle" style={{ marginTop: -4 }}>Buy and sell pets for real <b>SOL</b> — paid straight from your Phantom wallet.</p>
             <div className="market-tabs">
               <button className={"market-tab" + (marketTab === "exclusive" ? " market-tab-on" : "")} onClick={() => setMarketTab("exclusive")}>✨ Exclusive</button>
               <button className={"market-tab" + (marketTab === "player" ? " market-tab-on" : "")} onClick={() => setMarketTab("player")}>👥 Player</button>
@@ -2215,7 +2217,7 @@ export default function App() {
               <h3>💰 Buy PV</h3>
               <span className="coins"><Coin /> {Math.floor(pet.coins).toLocaleString()} {SIL}</span>
             </div>
-            <p className="subtitle" style={{ marginTop: -4 }}>Buy PV with real SOL — ◎1 SOL = {SOL_PV_RATE.toLocaleString()} PV. <b>Devnet</b> (test SOL).</p>
+            <p className="subtitle" style={{ marginTop: -4 }}>Buy PV with real SOL — ◎1 SOL = {SOL_PV_RATE.toLocaleString()} PV.</p>
 
             {!wallet ? (
               <p className="empty">🔌 Connect your wallet to buy PV with SOL.</p>
@@ -2246,7 +2248,7 @@ export default function App() {
             )}
 
             {buying && <p className="subtitle" style={{ textAlign: "center" }}>⏳ Processing…</p>}
-            <p className="empty">💡 Running on Solana <b>devnet</b> for testing — pay with free test SOL (faucet.solana.com). Real mainnet SOL comes after testing.</p>
+            <p className="empty">⚠️ This is <b>real SOL on Solana mainnet</b> — double-check the amount before confirming in Phantom.</p>
             <button className="btn btn-ghost" onClick={() => setModal(null)}>Close</button>
           </div>
         </div>

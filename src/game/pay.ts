@@ -1,4 +1,4 @@
-// Реальная покупка PV за SOL (devnet). Клиент формирует перевод SOL на treasury и отправляет
+// Реальная покупка PV за SOL (mainnet). Клиент формирует перевод SOL на treasury и отправляет
 // через Phantom; дальше серверная функция проверит транзакцию в блокчейне и начислит PV.
 import { Connection, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { getPhantom } from "./wallet";

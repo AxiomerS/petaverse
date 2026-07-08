@@ -85,9 +85,9 @@ flowchart LR
 5. **🛍️ Trade on the marketplace.** Sell or auction your pets (with their level & buffs) for **SOL**.
 6. **💱 Exchange & hold.** Swap PV to SOL, or hold **$PV** as it grows with the universe.
 
-> ⚠️ **Honest note:** the real‑money layer (wallet, on‑chain trades, global leaderboard) is on the
-> [roadmap](#-roadmap). Today Petaverse is a **playable demo** — progress is saved locally in your
-> browser, and the economy shows how the full onchain version will work.
+> ✅ **Live now:** wallet-secured payments, real SOL trades, quests, marketplace and the global
+> leaderboard all run through a server-side economy on Solana **mainnet**. The **$PV** token launch is
+> next on the [roadmap](#-roadmap).
 
 ---
 

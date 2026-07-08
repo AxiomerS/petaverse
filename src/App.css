@@ -2293,4 +2293,27 @@ textarea {
     right: 8px;
     bottom: 8px;
   }
+  /* Шапка на узких экранах: центрированный .brand (position:absolute) наезжал на .topbar-right
+     (кошелёк/PV/Market), т.к. на десктопе им хватало места по бокам, а на мобильном — нет.
+     Ставим топбар в колонку и возвращаем .brand в обычный поток (первым элементом сверху). */
+  .topbar {
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 12px;
+  }
+  .brand {
+    position: static;
+    transform: none;
+    top: auto;
+    left: auto;
+  }
+  /* Кнопки кошелёк/баланс/Market в один ряд не влезают на узких экранах и обрезаются краем
+     вьюпорта — разрешаем перенос на вторую строку вместо горизонтального оверфлоу. */
+  .topbar-right {
+    flex-wrap: wrap;
+    justify-content: center;
+    padding: 0 8px;
+  }
 }
