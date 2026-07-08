@@ -1754,7 +1754,7 @@ textarea {
   position: absolute;
   left: 50%;
   bottom: 4px;
-  transform: translateX(-50%);
+  transform: translateX(calc(-50% + 6px));
   width: 110px;
   height: 40px;
   border-radius: 50%;
