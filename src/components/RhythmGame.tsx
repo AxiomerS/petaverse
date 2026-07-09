@@ -35,24 +35,44 @@ function comboMult(combo: number): number {
 type Judge = "perfect" | "good" | "miss";
 type Note = { id: number; lane: number; t: number; approach: number; hit: null | Judge };
 
+// Сколько нот падает ОДНОВРЕМЕННО (аккорд) в этот момент трека — усложнение по ходу игры:
+// первые 15% — только одиночные ноты, дальше подмешиваются двойные, с ~55% — тройные,
+// а после 80% изредка (10%) встречаются четверные (все 4 дорожки разом).
+function pickArity(progress: number): number {
+  const r = Math.random();
+  if (progress > 0.8) {
+    if (r < 0.1) return 4;
+    if (r < 0.35) return 3;
+    if (r < 0.6) return 2;
+    return 1;
+  }
+  if (progress > 0.55) {
+    if (r < 0.15) return 3;
+    if (r < 0.4) return 2;
+    return 1;
+  }
+  if (progress > 0.15) {
+    if (r < 0.22) return 2;
+    return 1;
+  }
+  return 1;
+}
+
 // Сгенерировать чарт. Скорость плавно растёт от 1.0 до MAX_SPEED: интервалы между
 // нотами и время их полёта делятся на текущую скорость → к концу всё быстрее.
 function buildChart(): Note[] {
   const notes: Note[] = [];
   let id = 0;
   let t = 2000; // первая нота через 2с (плавный заход)
-  const N = 150; // длиннее трек → реально дожить до 100+ комбо (множители очков)
+  const N = 300; // трек в 2 раза длиннее прежнего (было 150)
   for (let i = 0; i < N; i++) {
     const speed = 1 + (MAX_SPEED - 1) * (i / (N - 1));
     const approach = BASE_APPROACH / speed;
-    const lane = Math.floor(Math.random() * LANES);
-    notes.push({ id: id++, lane, t, approach, hit: null });
-    // ближе к концу иногда добавляем вторую ноту в тот же момент
-    if (i > 24 && Math.random() < 0.2) {
-      let l2 = Math.floor(Math.random() * LANES);
-      if (l2 === lane) l2 = (l2 + 1) % LANES;
-      notes.push({ id: id++, lane: l2, t, approach, hit: null });
-    }
+    const arity = pickArity(i / N);
+    const lanes = new Set<number>();
+    lanes.add(Math.floor(Math.random() * LANES));
+    while (lanes.size < arity) lanes.add(Math.floor(Math.random() * LANES));
+    for (const lane of lanes) notes.push({ id: id++, lane, t, approach, hit: null });
     t += BASE_INTERVAL / speed;
   }
   return notes;

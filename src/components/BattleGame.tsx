@@ -19,6 +19,7 @@ const TIPS = [
 
 // Ставки на бой (Sil). 0 = дружеский бой без ставки.
 const BET_OPTIONS = [0, 25, 50, 100, 200];
+const INTRO_MS = 1700; // сколько держим экран "pet1 VS pet2" перед рулеткой (кто бьёт первым)
 
 // Ранкинг арены — топ-игроки (локальный/фейковый; настоящий глобальный лист будет с бэкендом).
 // У каждого — винрейт и лучший питомец с его силой.
@@ -46,7 +47,7 @@ const ARENA_PLAYERS: ArenaPlayer[] = [
   { name: "NewbieCat", wins: 12, losses: 140, species: "cat", power: 120 },
 ];
 
-type Phase = "loadout" | "searching" | "flip" | "battle" | "loot" | "done";
+type Phase = "loadout" | "searching" | "intro" | "flip" | "battle" | "loot" | "done";
 type Fighter = { name: string; species: string; level: number; accessories: string[] } & Loadout;
 type Loot = { kind: "accessory" | "food"; id: string; label: string; emoji: string; rarity: Rarity };
 
@@ -117,16 +118,19 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
     return { name: (prof.name && prof.name.trim()) || "Rival", species: prof.species, level: prof.level, accessories: prof.accessories ?? [], ...lo };
   }
 
-  // Запустить «бросок стрелки» и бой с готовым соперником.
+  // Показать заставку "pet1 VS pet2" (с их шмотками), затем «бросок стрелки» и сам бой.
   function startFlip(b: Fighter, online: boolean) {
     setOnlineMatch(online);
-    const first = Math.random() < 0.5; // кто бьёт первым
     setBot(b);
     setPMax(loadout.hp); setPHp(loadout.hp); setOMax(b.hp); setOHp(b.hp);
-    setArrowSpin(0);
-    setPhase("flip");
-    requestAnimationFrame(() => setArrowSpin(360 * 5 + (first ? 180 : 0)));
-    timerRef.current = window.setTimeout(() => startBattle(b, first), 2000);
+    setPhase("intro");
+    timerRef.current = window.setTimeout(() => {
+      const first = Math.random() < 0.5; // кто бьёт первым
+      setArrowSpin(0);
+      setPhase("flip");
+      requestAnimationFrame(() => setArrowSpin(360 * 5 + (first ? 180 : 0)));
+      timerRef.current = window.setTimeout(() => startBattle(b, first), 2000);
+    }, INTRO_MS);
   }
 
   // Найти соперника. Онлайн: ищем реального игрока до 2 минут, потом ТИХО подставляем бота.
@@ -364,7 +368,7 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
           </div>
         )}
 
-        {(phase === "flip" || phase === "battle" || phase === "done") && bot && (
+        {(phase === "intro" || phase === "flip" || phase === "battle" || phase === "done") && bot && (
           <div className="bt-arena">
             <div className="bt-side">
               <span key={`p-${turn}`} className={"bt-petwrap" + (flash?.attacker === "p" ? " bt-lunge-r" : flash?.side === "p" ? " bt-hurt" : "")}><PetArt species={petSpecies} size={84} /></span>
@@ -392,6 +396,7 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
           </div>
         )}
 
+        {phase === "intro" && <p className="subtitle bt-flipcap">⚔️ Opponent found!</p>}
         {phase === "flip" && <p className="subtitle bt-flipcap">🎯 Spinning to decide who strikes first…</p>}
 
         {phase === "loot" && (
