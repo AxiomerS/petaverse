@@ -324,3 +324,29 @@ $$;
 revoke execute on function public.rl_check(text,int,bigint,bigint) from public;
 grant execute on function public.rl_check(text,int,bigint,bigint) to service_role;
 create policy listings_read on public.listings for select using (true);
+
+-- 7) Глобальная веха "в игре впервые стало 10+ игроков" -----------------------------------------
+-- Раньше run-reward (награда за топ в Ranks) открывался у КАЖДОГО игрока по-своему: как только
+-- playerCount()>10 на момент ЕГО запроса. Теперь фиксируем момент, когда порог был пройден,
+-- ОДИН раз на всю игру — и открываем награду всем ОДНОВРЕМЕННО спустя 2 часа после этого момента
+-- (см. RUN_REWARD_UNLOCK_DELAY в edge fn pv). mark_milestone_once — атомарный INSERT..ON CONFLICT:
+-- при гонке (несколько игроков одновременно пересекли порог) побеждает только первая запись.
+create table if not exists public.milestones (
+  key text primary key,
+  at  bigint not null   -- epoch ms, когда веха была впервые достигнута
+);
+alter table public.milestones enable row level security; -- политик нет — только service_role
+
+create or replace function public.mark_milestone_once(p_key text, p_now bigint)
+returns bigint
+language plpgsql
+as $$
+declare v_at bigint;
+begin
+  insert into public.milestones (key, at) values (p_key, p_now) on conflict (key) do nothing;
+  select at into v_at from public.milestones where key = p_key;
+  return v_at;
+end;
+$$;
+revoke execute on function public.mark_milestone_once(text,bigint) from public;
+grant execute on function public.mark_milestone_once(text,bigint) to service_role;

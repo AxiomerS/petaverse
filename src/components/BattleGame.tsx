@@ -19,7 +19,8 @@ const TIPS = [
 
 // Ставки на бой (Sil). 0 = дружеский бой без ставки.
 const BET_OPTIONS = [0, 25, 50, 100, 200];
-const INTRO_MS = 1700; // сколько держим экран "pet1 VS pet2" перед рулеткой (кто бьёт первым)
+const INTRO_MS = 2600; // сколько держим экран "pet1 VS pet2" перед рулеткой (кто бьёт первым)
+const FLIP_MS = 4000; // длительность рулетки "кто бьёт первым" — держать в синхроне с .bt-arrow transition в App.css
 
 // Ранкинг арены — топ-игроки (локальный/фейковый; настоящий глобальный лист будет с бэкендом).
 // У каждого — винрейт и лучший питомец с его силой.
@@ -105,8 +106,9 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
         accs.push(pool[Math.floor(Math.random() * pool.length)].id);
       }
     }
-    const lo = loadoutPower(lvl, accs, Math.random() < 0.3 ? 0.1 : 0);
     const species = PETS[Math.floor(Math.random() * PETS.length)].id;
+    const rarity = PETS.find((p) => p.id === species)?.rarity ?? "common";
+    const lo = loadoutPower(lvl, accs, Math.random() < 0.3 ? 0.1 : 0, rarity);
     return { name: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)], species, level: lvl, accessories: accs, ...lo };
   }
 
@@ -114,7 +116,8 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
   async function buildOnlineFighter(): Promise<Fighter | null> {
     const prof = await fetchOpponent();
     if (!prof) return null;
-    const lo = loadoutPower(prof.level, prof.accessories ?? [], 0);
+    const rarity = PETS.find((p) => p.id === prof.species)?.rarity ?? "common";
+    const lo = loadoutPower(prof.level, prof.accessories ?? [], 0, rarity);
     return { name: (prof.name && prof.name.trim()) || "Rival", species: prof.species, level: prof.level, accessories: prof.accessories ?? [], ...lo };
   }
 
@@ -129,7 +132,7 @@ export function BattleGame({ onClose, onWin, onLose, petName, petSpecies, level,
       setArrowSpin(0);
       setPhase("flip");
       requestAnimationFrame(() => setArrowSpin(360 * 5 + (first ? 180 : 0)));
-      timerRef.current = window.setTimeout(() => startBattle(b, first), 2000);
+      timerRef.current = window.setTimeout(() => startBattle(b, first), FLIP_MS);
     }, INTRO_MS);
   }
 

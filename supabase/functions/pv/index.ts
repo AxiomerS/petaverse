@@ -14,7 +14,11 @@ const DAILY_REWARD = 50;
 const DAILY_COOLDOWN = 2 * 3600 * 1000; // дейли раз в 2 часа
 const BATTLE_MAX_PER_DAY = 3000;        // дневной кэп выигрыша на арене (won доверяем — Phase 1)
 const RUN_REWARD_COOLDOWN = 3600 * 1000;
-const PLAYER_MIN = 10;                  // PV за арену/ритм включается только когда игроков в игре > 10
+const PLAYER_MIN = 10;                  // PV за арену включается только когда игроков в игре > 10
+// Награда за топ в Ranks (run-reward) открывается ОДИН РАЗ НА ВСЮ ИГРУ, спустя это время после
+// момента, когда игроков впервые стало больше PLAYER_MIN — так все получают доступ ОДНОВРЕМЕННО,
+// а не по индивидуальному кулдауну с разного момента (см. milestones/mark_milestone_once в SQL).
+const RUN_REWARD_UNLOCK_DELAY = 2 * 3600 * 1000;
 const STAKES = new Set([5, 10, 25, 50, 100, 200]);
 const RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
 function colorOf(n: number): "green" | "red" | "black" { return n === 0 ? "green" : RED.has(n) ? "red" : "black"; }
@@ -93,6 +97,20 @@ async function playerCount(): Promise<number> {
   }
 }
 
+// Момент (epoch ms), когда игроков впервые стало больше PLAYER_MIN — null, если ещё не набралось.
+// Один раз записанное значение больше не меняется (mark_milestone_once — INSERT..ON CONFLICT DO NOTHING),
+// поэтому после первой записи не дёргаем дорогой playerCount() снова — просто читаем строку.
+async function playersMilestoneAt(now: number): Promise<number | null> {
+  const rows = await fetch(`${SB_URL}/rest/v1/milestones?key=eq.players_min&select=at`, { headers: sbHeaders() }).then((r) => r.json());
+  const existing = rows?.[0]?.at;
+  if (typeof existing === "number") return existing;
+  if ((await playerCount()) <= PLAYER_MIN) return null;
+  const res = await fetch(`${SB_URL}/rest/v1/rpc/mark_milestone_once`, { method: "POST", headers: sbHeaders(), body: JSON.stringify({ p_key: "players_min", p_now: now }) });
+  const v = await res.json().catch(() => null);
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
@@ -107,7 +125,11 @@ Deno.serve(async (req) => {
     if (action === "sync" || action === "collect") {
       const rate = PASSIVE_PER_MIN * levelMult(level);
       const coins = await rpc("pv_collect", { p_wallet: wallet, p_rate: rate, p_cap_ms: COLLECT_CAP_MS, p_now: now });
-      return jsonResp({ coins: Math.floor(coins ?? b.coins), lastDaily: b.last_daily });
+      // Заодно фиксируем веху "10+ игроков", если она ещё не наступила — sync/collect дёргается
+      // всеми активными игроками каждые ~20с, так что порог отловится почти сразу, как будет пройден.
+      const milestoneAt = await playersMilestoneAt(now);
+      const runRewardUnlockAt = milestoneAt !== null ? milestoneAt + RUN_REWARD_UNLOCK_DELAY : null;
+      return jsonResp({ coins: Math.floor(coins ?? b.coins), lastDaily: b.last_daily, runRewardUnlockAt });
     }
 
     if (action === "daily") {
@@ -154,8 +176,13 @@ Deno.serve(async (req) => {
     }
 
     if (action === "run-reward") {
-      // PV за ритм-игру (награда за топ) — только когда игроков в игре стало больше 10.
-      if ((await playerCount()) <= PLAYER_MIN) return jsonResp({ error: "rewards unlock at 10+ players", coins: Math.floor(b.coins), locked: true }, 409);
+      // PV за ритм-игру (награда за топ) — открывается ОДНОВРЕМЕННО у всех, спустя
+      // RUN_REWARD_UNLOCK_DELAY после того, как игроков в игре впервые стало больше PLAYER_MIN.
+      const milestoneAt = await playersMilestoneAt(now);
+      const unlockAt = milestoneAt !== null ? milestoneAt + RUN_REWARD_UNLOCK_DELAY : null;
+      if (unlockAt === null || now < unlockAt) {
+        return jsonResp({ error: "rewards unlock 2h after the game reaches 10+ players", coins: Math.floor(b.coins), locked: true, runRewardUnlockAt: unlockAt }, 409);
+      }
       // Ранг считаем НА СЕРВЕРЕ из scores (не доверяем клиенту). Сам счёт клиентский → награда капнута.
       const myRows = await fetch(`${SB_URL}/rest/v1/scores?wallet=eq.${encodeURIComponent(wallet)}&select=score`, { headers: sbHeaders() }).then((r) => r.json());
       const myScore = Number(myRows?.[0]?.score ?? 0);

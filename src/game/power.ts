@@ -8,9 +8,15 @@ export const BASE_HP = 300;
 export const HP_PER_LEVEL = 20; // уровень повышает HP
 export const CRIT_CAP = 0.25; // суммарный шанс крита не выше 25%
 
-// Сила и HP от надетого аксессуара по редкости.
-const ACC_POWER: Record<Rarity, number> = { common: 0, rare: 10, epic: 20, legendary: 35, mythic: 60 };
-const ACC_HP: Record<Rarity, number> = { common: 0, rare: 50, epic: 100, legendary: 180, mythic: 300 };
+// Сила и HP от надетого аксессуара по редкости (×1.5 от прежних значений).
+const ACC_POWER: Record<Rarity, number> = { common: 0, rare: 15, epic: 30, legendary: 53, mythic: 90 };
+const ACC_HP: Record<Rarity, number> = { common: 0, rare: 75, epic: 150, legendary: 270, mythic: 450 };
+
+// Бонус к силе/HP от редкости САМОГО ВИДА питомца (не аксессуаров) — более редкие виды базово крепче.
+// Дельта поверх обычного (common) на 1 уровне: common 60/320, rare 80/400, epic 100/460,
+// legendary 125/530, mythic 155/600.
+const RARITY_POWER: Record<Rarity, number> = { common: 0, rare: 20, epic: 40, legendary: 65, mythic: 95 };
+const RARITY_HP: Record<Rarity, number> = { common: 0, rare: 80, epic: 140, legendary: 210, mythic: 280 };
 
 // Модификатор крита (epic и выше): шанс крита и доп. урон крита (доля).
 const ACC_CRIT: Partial<Record<Rarity, { chance: number; dmg: number }>> = {
@@ -22,10 +28,10 @@ const ACC_CRIT: Partial<Record<Rarity, { chance: number; dmg: number }>> = {
 export type Loadout = { power: number; hp: number; critChance: number; critMult: number };
 
 // Итоговая «сборка»: сила (× бафф еды в %), HP, шанс и множитель крита.
-// powerBuffPct — доля (например 0.2 = +20% к силе).
-export function loadoutPower(level: number, accessories: string[], powerBuffPct: number): Loadout {
-  let base = BASE_POWER + level * POWER_PER_LEVEL;
-  let hp = BASE_HP + level * HP_PER_LEVEL;
+// powerBuffPct — доля (например 0.2 = +20% к силе). rarity — редкость вида питомца (не аксессуаров).
+export function loadoutPower(level: number, accessories: string[], powerBuffPct: number, rarity: Rarity): Loadout {
+  let base = BASE_POWER + level * POWER_PER_LEVEL + RARITY_POWER[rarity];
+  let hp = BASE_HP + level * HP_PER_LEVEL + RARITY_HP[rarity];
   const critChances: number[] = [];
   let dmg = 0;
   for (const id of accessories) {

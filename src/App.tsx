@@ -58,6 +58,8 @@ const LINK_GITHUB = "https://github.com/AxiomerS/petaverse";
 const LINK_TWITTER = "https://x.com/PetaVerseSol";
 const LINK_PUMPFUN = "https://pump.fun/";
 const TOKEN_CA = ""; // адрес контракта токена; пусто = ещё не запущен
+// Редкость вида питомца по его id — для боевых характеристик в Battle Arena (loadoutPower).
+const speciesRarity = (species: string): Rarity => PETS.find((p) => p.id === species)?.rarity ?? "common";
 
 // Реальная покупка PV за SOL — курс и пакеты заданы в game/pay.ts (mainnet).
 
@@ -247,7 +249,7 @@ export default function App() {
         const p = cloudPet ?? petRef.current;
         if (p && p.bestScore > 0) submitScore(wallet, p.name, p.bestScore); // засветиться в лидерборде
         if (p && p.battleWins + p.battleLosses > 0)
-          submitArena({ wallet, name: p.name, species: p.species, power: loadoutPower(p.level, p.accessories, 0).power, wins: p.battleWins, losses: p.battleLosses });
+          submitArena({ wallet, name: p.name, species: p.species, power: loadoutPower(p.level, p.accessories, 0, speciesRarity(p.species)).power, wins: p.battleWins, losses: p.battleLosses });
         if (p) upsertPvpProfile({ wallet, name: p.name, species: p.species, level: p.level, accessories: p.accessories }); // профиль для PvP
         // Авторитетный баланс PV с сервера (начисляет пассив + бэкфилл). Требует верификации (JWT).
         if (p) pvSync(p.level).then((r) => { if (r && !cancelled) setPet((pp) => (pp ? { ...pp, coins: r.coins, lastDaily: r.lastDaily } : pp)); });
@@ -895,7 +897,7 @@ export default function App() {
     const res = await pvBattle(stake, true, pet.level); // серверный расчёт PV
     const coins = "error" in res ? pet.coins : res.coins;
     setPet({ ...pet, coins, xp, level, battleWins: pet.battleWins + 1, inventory, ownedAccessories, updatedAt: now });
-    if (wallet) submitArena({ wallet, name: pet.name, species: pet.species, power: loadoutPower(pet.level, pet.accessories, 0).power, wins: pet.battleWins + 1, losses: pet.battleLosses });
+    if (wallet) submitArena({ wallet, name: pet.name, species: pet.species, power: loadoutPower(pet.level, pet.accessories, 0, speciesRarity(pet.species)).power, wins: pet.battleWins + 1, losses: pet.battleLosses });
     const pvNote = "error" in res ? " (PV needs a verified wallet)" : res.locked ? " · arena PV unlocks at 10+ players" : "";
     setToast(`🏆 Victory! +60 XP, looted ${lootLabel}${pvNote}`);
   }
@@ -910,7 +912,7 @@ export default function App() {
     const res = await pvBattle(stake, false, pet.level);
     const coins = "error" in res ? pet.coins : res.coins;
     setPet({ ...pet, stats: { ...pet.stats, health }, coins, battleLosses: pet.battleLosses + 1, updatedAt: now });
-    if (wallet) submitArena({ wallet, name: pet.name, species: pet.species, power: loadoutPower(pet.level, pet.accessories, 0).power, wins: pet.battleWins, losses: pet.battleLosses + 1 });
+    if (wallet) submitArena({ wallet, name: pet.name, species: pet.species, power: loadoutPower(pet.level, pet.accessories, 0, speciesRarity(pet.species)).power, wins: pet.battleWins, losses: pet.battleLosses + 1 });
     setToast(`💔 Defeat! ${pet.name} took 10 damage${stake ? ` and lost ${stake} ${SIL}` : ""}`);
   }
 
@@ -1875,7 +1877,7 @@ export default function App() {
         async function claimRunReward() {
           if (!rewardReady) return;
           const res = await pvRunReward(myRank || 999); // сервер начисляет по рангу (кулдаун серверный)
-          if ("error" in res) { if (typeof res.coins === "number") setCoins(res.coins); return setToast(res.error.includes("10+") ? "🏆 Run rewards unlock at 10+ players" : "Reward not ready yet"); }
+          if ("error" in res) { if (typeof res.coins === "number") setCoins(res.coins); return setToast(res.error.includes("10+") ? "🏆 Run rewards unlock for everyone 2h after the game hits 10+ players" : "Reward not ready yet"); }
           setPet((p) => (p ? { ...p, coins: res.coins, lastRunReward: Date.now(), updatedAt: Date.now() } : p));
           setToast(`🏆 Run reward${inTop ? ` (rank #${myRank})` : ""}: +${res.credited} ${SIL}`);
         }
@@ -2173,7 +2175,7 @@ export default function App() {
           petSpecies={pet.species}
           level={pet.level}
           accessories={pet.accessories}
-          loadout={loadoutPower(pet.level, pet.accessories, activePowerBuff(pet.powerBuff, Date.now()) + potEff.power)}
+          loadout={loadoutPower(pet.level, pet.accessories, activePowerBuff(pet.powerBuff, Date.now()) + potEff.power, speciesRarity(pet.species))}
           powerBuffActive={activePowerBuff(pet.powerBuff, Date.now()) + potEff.power}
           wins={pet.battleWins}
           losses={pet.battleLosses}
