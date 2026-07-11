@@ -2443,6 +2443,7 @@ export default function App() {
                 // остальные базовые заблокированы; rare+ — открываются из сундука.
                 const owned = pet.ownedSpecies.includes(p.id);
                 const active = pet.species === p.id;
+                const hasPerk = !!SPECIES_PERK[p.id];
                 const perk = SPECIES_PERK[p.id]?.label ?? (p.rarity === "common" ? "Starter pet" : "");
                 return (
                   <button
@@ -2454,7 +2455,7 @@ export default function App() {
                     <span className="rar-dot" style={{ background: RARITY[p.rarity].color }} />
                     <span className="inv-emoji"><PetArt species={p.id} size={34} /></span>
                     <span className="inv-name">{p.label}</span>
-                    <span className="inv-perk">{perk}</span>
+                    <span className={"inv-perk" + (hasPerk ? " inv-perk-badge" : "")}>{perk}</span>
                     <span className="inv-feed">{!owned ? "🔒 Locked" : active ? "Active ✓" : "Select"}</span>
                   </button>
                 );

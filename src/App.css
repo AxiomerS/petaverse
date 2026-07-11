@@ -1455,6 +1455,14 @@ textarea {
   color: var(--accent-ink);
   text-align: center;
 }
+.inv-perk-badge {
+  margin-top: 1px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 176, 32, 0.16);
+  border: 1px solid rgba(255, 176, 32, 0.4);
+  font-weight: 700;
+}
 .perk-line {
   margin: 0;
   font-size: 13px;
@@ -2097,6 +2105,19 @@ textarea {
   font-size: 12px;
   font-weight: 600;
   color: var(--ink-2);
+}
+.rg-mult {
+  color: #ffd23f;
+  font-weight: 800;
+}
+.rg-mult-pop {
+  display: inline-block;
+  animation: rgmultpop 0.6s ease-out;
+}
+@keyframes rgmultpop {
+  0% { transform: scale(1.9); color: #fff2b0; text-shadow: 0 0 12px #ffd23f; }
+  40% { transform: scale(1.25); }
+  100% { transform: scale(1); }
 }
 .rg-bigscore {
   font-size: 38px;

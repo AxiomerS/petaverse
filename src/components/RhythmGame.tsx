@@ -92,6 +92,8 @@ export function RhythmGame({ onClose, onFinish, petName, petEmoji, petSpecies }:
   const clockRef = useRef(0);
   const judgeRef = useRef<{ kind: Judge; at: number } | null>(null);
   const flashRef = useRef<number[]>([0, 0, 0, 0]);
+  const comboTierRef = useRef(0); // текущий тир множителя комбо (0..3) — растёт со 100/200/300
+  const tierPopRef = useRef(-1000); // момент последнего повышения тира — для анимации всплеска
   const heldRef = useRef<boolean[]>([false, false, false, false]);
   const rewardedRef = useRef(false);
   const doneRef = useRef(false); // после конца игнорируем нажатия
@@ -138,6 +140,7 @@ export function RhythmGame({ onClose, onFinish, petName, petEmoji, petSpecies }:
       // нажатие мимо ритма (нет ноты рядом) — промах и сброс комбо (анти-спам).
       s.combo = 0;
       s.miss++;
+      comboTierRef.current = 0;
       judgeRef.current = { kind: "miss", at: now };
       return;
     }
@@ -148,6 +151,8 @@ export function RhythmGame({ onClose, onFinish, petName, petEmoji, petSpecies }:
     // Очки: perfect 200 / good 100, умноженные на множитель комбо.
     const base = best.hit === "perfect" ? 200 : 100;
     s.score += Math.round(base * comboMult(s.combo));
+    const tier = Math.min(3, Math.floor(s.combo / 100));
+    if (tier > comboTierRef.current) { comboTierRef.current = tier; tierPopRef.current = now; }
     judgeRef.current = { kind: best.hit, at: now };
     reactRef.current = now; // питомец подпрыгивает в такт попаданию
     playHit(best.hit);
@@ -158,6 +163,8 @@ export function RhythmGame({ onClose, onFinish, petName, petEmoji, petSpecies }:
     notesRef.current = buildChart();
     statsRef.current = freshStats();
     judgeRef.current = null;
+    comboTierRef.current = 0;
+    tierPopRef.current = -1000;
     rewardedRef.current = false;
     doneRef.current = false;
     clockRef.current = 0;
@@ -183,6 +190,7 @@ export function RhythmGame({ onClose, onFinish, petName, petEmoji, petSpecies }:
           n.hit = "miss";
           statsRef.current.combo = 0;
           statsRef.current.miss++;
+          comboTierRef.current = 0;
           judgeRef.current = { kind: "miss", at: now };
         }
       }
@@ -320,6 +328,8 @@ export function RhythmGame({ onClose, onFinish, petName, petEmoji, petSpecies }:
   const total = s.perfect + s.good + s.miss;
   const acc = total ? Math.round(((s.perfect + s.good * 0.5) / total) * 100) : 100;
   const judge = judgeRef.current && now - judgeRef.current.at < 480 ? judgeRef.current : null;
+  const mult = comboMult(s.combo);
+  const tierPop = now - tierPopRef.current < 600;
 
   return (
     <div className="scrim scrim-top" onClick={() => onClose()}>
@@ -328,7 +338,11 @@ export function RhythmGame({ onClose, onFinish, petName, petEmoji, petSpecies }:
           <h3>🎵 Rhythm</h3>
           <span className="rg-hud">
             <b className="rg-score">♪ {s.score.toLocaleString()}</b>
-            <span className="rg-sub">Combo {s.combo} · {acc}% · <span className="rg-miss">{s.miss}/{MAX_MISS}✗</span></span>
+            <span className="rg-sub">
+              Combo {s.combo}
+              {mult > 1 && <span className={"rg-mult" + (tierPop ? " rg-mult-pop" : "")}> ×{mult.toFixed(1)}</span>}
+              {" "}· {acc}% · <span className="rg-miss">{s.miss}/{MAX_MISS}✗</span>
+            </span>
           </span>
         </div>
 
