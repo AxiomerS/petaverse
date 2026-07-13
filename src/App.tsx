@@ -24,6 +24,9 @@ import { BattleGame } from "./components/BattleGame";
 // Игровая валюта: PV (внутриигровая валюта и крипто-токен $PV).
 const SIL = "PV";
 
+// Виды с недавно добавленным оригинальным артом — подсвечиваем бейджем "New" в списке питомцев.
+const NEW_SPECIES = new Set(["tiger", "dino"]);
+
 // Соперники в лидерборде — лучшие забеги в ритм-игре (локальные/фейковые;
 // для настоящего глобального борда «от игроков» нужен бэкенд — следующий большой шаг).
 const LEADERBOARD_BOTS = [
@@ -2445,6 +2448,7 @@ export default function App() {
                 const active = pet.species === p.id;
                 const hasPerk = !!SPECIES_PERK[p.id];
                 const perk = SPECIES_PERK[p.id]?.label ?? (p.rarity === "common" ? "Starter pet" : "");
+                const isNew = NEW_SPECIES.has(p.id);
                 return (
                   <button
                     key={p.id}
@@ -2452,6 +2456,7 @@ export default function App() {
                     onClick={() => (owned ? switchSpecies(p.id) : setToast(p.rarity === "common" ? "You already chose your starter pet 🔒" : "Win it from the Pet Chest 🥚"))}
                     title={`${RARITY[p.rarity].label} · ${perk}`}
                   >
+                    {isNew && <span className="inv-new">New</span>}
                     <span className="rar-dot" style={{ background: RARITY[p.rarity].color }} />
                     <span className="inv-emoji"><PetArt species={p.id} size={34} /></span>
                     <span className="inv-name">{p.label}</span>

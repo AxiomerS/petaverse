@@ -1435,6 +1435,19 @@ textarea {
   font-weight: 700;
   color: var(--accent-ink);
 }
+.inv-new {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: #2b1c04;
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 1px 6px;
+  z-index: 1;
+}
 .inv-emoji {
   font-size: 34px;
 }
