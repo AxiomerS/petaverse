@@ -193,6 +193,14 @@ export default function App() {
     return () => clearInterval(iv);
   }, []);
 
+  // Отдельный лёгкий тик раз в секунду ТОЛЬКО для UI-обратных отсчётов баффов — не трогает игровую
+  // логику/сейв, поэтому таймер на экране не "скачет" по 3с вместе с основным game-тиком.
+  const [uiNow, setUiNow] = useState(() => Date.now());
+  useEffect(() => {
+    const iv = setInterval(() => setUiNow(Date.now()), 1000);
+    return () => clearInterval(iv);
+  }, []);
+
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(""), 2200);
@@ -1530,16 +1538,20 @@ export default function App() {
                 </div>
 
                 {(() => {
-                  const active = pet.buffs.filter((b) => b.expiresAt > Date.now());
+                  const active = pet.buffs.filter((b) => b.expiresAt > uiNow);
                   if (active.length === 0) return null;
                   const chip = (b: { kind: BuffKind; expiresAt: number }) => {
                     const m = BUFFS[b.kind];
-                    const left = Math.max(0, b.expiresAt - Date.now());
+                    const left = Math.max(0, b.expiresAt - uiNow);
                     const mm = Math.floor(left / 60000);
                     const ss = Math.floor((left % 60000) / 1000);
+                    const pct = Math.max(0, Math.min(100, (left / m.durationMs) * 100));
                     return (
                       <span key={b.kind} className="buff-chip" title={`${m.label}`}>
-                        {m.emoji} {m.label} {mm}:{String(ss).padStart(2, "0")}
+                        <span className="buff-ring" style={{ background: `conic-gradient(var(--accent) ${pct}%, rgba(255,255,255,0.18) 0)` }}>
+                          <span className="buff-ring-inner">{m.emoji}</span>
+                        </span>
+                        {m.label} {mm}:{String(ss).padStart(2, "0")}
                       </span>
                     );
                   };
