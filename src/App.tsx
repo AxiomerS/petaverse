@@ -193,8 +193,8 @@ export default function App() {
     return () => clearInterval(iv);
   }, []);
 
-  // Отдельный лёгкий тик раз в секунду ТОЛЬКО для UI-обратных отсчётов баффов — не трогает игровую
-  // логику/сейв, поэтому таймер на экране не "скачет" по 3с вместе с основным game-тиком.
+  // Отдельный лёгкий тик раз в секунду ТОЛЬКО для UI-обратных отсчётов (баффы, daily) — не трогает
+  // игровую логику/сейв, поэтому таймеры на экране не "скачут" по 3с вместе с основным game-тиком.
   const [uiNow, setUiNow] = useState(() => Date.now());
   useEffect(() => {
     const iv = setInterval(() => setUiNow(Date.now()), 1000);
@@ -1053,7 +1053,7 @@ export default function App() {
   // и баланс PV живут в облаке per-wallet, и абузер не сбросит их, очистив localStorage/создав
   // новый локальный «аккаунт» (для нового старта нужен реально новый кошелёк Phantom — это трение).
   const rewardsUnlocked = !!wallet && verified;
-  const dailyReady = pet ? Date.now() - pet.lastDaily >= DAILY_COOLDOWN : false;
+  const dailyReady = pet ? uiNow - pet.lastDaily >= DAILY_COOLDOWN : false;
   // Дейли начисляет СЕРВЕР (фиксированная сумма, кулдаун серверный → сброс очисткой localStorage не работает).
   async function claimDaily() {
     if (!pet || !dailyReady) return;
@@ -1309,10 +1309,17 @@ export default function App() {
 
   function dailyLeft(): string {
     if (!pet) return "";
-    const ms = pet.lastDaily + DAILY_COOLDOWN - Date.now();
+    const ms = pet.lastDaily + DAILY_COOLDOWN - uiNow;
     const h = Math.floor(ms / 3_600_000);
     const m = Math.floor((ms % 3_600_000) / 60_000);
     return `${h}h ${m}m`;
+  }
+
+  // Доля прошедшего времени до следующей daily-награды (0..100) — для полоски прогресса на кнопке.
+  function dailyProgressPct(): number {
+    if (!pet) return 0;
+    const elapsed = uiNow - pet.lastDaily;
+    return Math.max(0, Math.min(100, (elapsed / DAILY_COOLDOWN) * 100));
   }
 
   // Inventory entries the pet actually owns (qty > 0).
@@ -1577,7 +1584,12 @@ export default function App() {
                 </div>
 
                 <button className="btn btn-daily" disabled={!dailyReady || !rewardsUnlocked} onClick={claimDaily} title={!rewardsUnlocked ? "Connect & verify your wallet to claim daily rewards" : undefined}>
-                  {!rewardsUnlocked ? "🎁 Connect wallet for daily" : dailyReady ? `🎁 Claim daily +${DAILY_REWARD} ${SIL}` : `🎁 Daily in ${dailyLeft()}`}
+                  {rewardsUnlocked && !dailyReady && (
+                    <span className="btn-daily-fill" style={{ width: `${dailyProgressPct()}%` }} />
+                  )}
+                  <span className="btn-daily-label">
+                    {!rewardsUnlocked ? "🎁 Connect wallet for daily" : dailyReady ? `🎁 Claim daily +${DAILY_REWARD} ${SIL}` : `🎁 Daily in ${dailyLeft()}`}
+                  </span>
                 </button>
               </>
             )}

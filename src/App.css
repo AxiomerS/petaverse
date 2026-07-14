@@ -1220,6 +1220,9 @@ textarea {
 
 /* ---------- daily button ---------- */
 .btn-daily {
+  position: relative;
+  z-index: 0; /* создаёт локальный стек. контекст, чтобы z-index у .btn-daily-label не "протекал" наружу поверх модалок */
+  overflow: hidden;
   width: 100%;
   background: var(--surface-2);
   color: var(--accent-ink);
@@ -1228,6 +1231,18 @@ textarea {
 }
 .btn-daily:not(:disabled):hover {
   transform: translateY(-2px);
+}
+.btn-daily-fill {
+  position: absolute;
+  inset: 0;
+  width: 0;
+  background: rgba(245, 179, 42, 0.22);
+  transition: width 1s linear;
+  z-index: 0;
+}
+.btn-daily-label {
+  position: relative;
+  z-index: 1;
 }
 
 /* ---------- modal / shop ---------- */
