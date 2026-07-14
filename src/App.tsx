@@ -60,7 +60,7 @@ const ADMIN_WALLET = "EezTHmjK2x4zYDSSjRwQadrgVsfapMUu9HtBMFXyTrPk";
 const LINK_GITHUB = "https://github.com/AxiomerS/petaverse";
 const LINK_TWITTER = "https://x.com/PetaVerseSol";
 const LINK_PUMPFUN = "https://pump.fun/";
-const TOKEN_CA = ""; // адрес контракта токена; пусто = ещё не запущен
+const TOKEN_CA: string = ""; // адрес контракта токена; пусто = ещё не запущен
 // Редкость вида питомца по его id — для боевых характеристик в Battle Arena (loadoutPower).
 const speciesRarity = (species: string): Rarity => PETS.find((p) => p.id === species)?.rarity ?? "common";
 
@@ -2235,11 +2235,18 @@ export default function App() {
             <div className="modal-head"><h3>💊 pump.fun</h3></div>
             <p className="subtitle" style={{ marginTop: -4 }}>Our token <b>$PV</b> lives on pump.fun.</p>
             <a className="btn btn-primary" href={LINK_PUMPFUN} target="_blank" rel="noreferrer">Open on pump.fun ↗</a>
-            <div className="ca-bar">
-              <span className="ca-label">CA:</span>
-              <span className="ca-addr">{TOKEN_CA || "not launched yet"}</span>
-              {TOKEN_CA && (
-                <button className="ca-copy" onClick={() => { navigator.clipboard?.writeText(TOKEN_CA); setToast("CA copied"); }}>Copy</button>
+            <div className="token-line">
+              <span className="tk-tick">$PV · {TOKEN_CA ? "live" : "not launched"}</span>
+              {TOKEN_CA ? (
+                <>
+                  <span className="tk-ca" title={TOKEN_CA} onClick={() => { navigator.clipboard?.writeText(TOKEN_CA); setToast("CA copied"); }}>
+                    {TOKEN_CA.slice(0, 6)}…{TOKEN_CA.slice(-4)}
+                  </span>
+                  <a className="tk-buy" href={LINK_PUMPFUN} target="_blank" rel="noreferrer">buy on pump.fun ▸</a>
+                  <span className="tk-warn">only trust this address</span>
+                </>
+              ) : (
+                <span className="tk-ca">coming soon</span>
               )}
             </div>
             <button className="btn btn-ghost" onClick={() => setModal(null)}>Close</button>

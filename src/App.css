@@ -632,38 +632,37 @@ textarea {
   border-color: #1ad17a;
 }
 
-/* ---------- CA address bar (pump.fun) ---------- */
-.ca-bar {
+/* ---------- token line (pump.fun) ---------- */
+.token-line {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: #0e0f14;
-  border: 1px solid var(--line);
+  gap: 5px 9px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(245, 179, 42, 0.05);
+  border: 1px solid #4a3d1f;
+  font-size: 12px;
 }
-.ca-label {
-  font-weight: 800;
-  color: #1ad17a;
-  font-size: 14px;
+.tk-tick {
+  font-weight: 600;
+  color: var(--accent);
 }
-.ca-addr {
-  flex: 1;
-  font-family: ui-monospace, "Cascadia Code", monospace;
-  font-size: 13px;
+.tk-ca {
   color: var(--ink-2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ca-copy {
-  border: 0;
-  border-radius: 8px;
-  padding: 5px 10px;
-  background: #1ad17a;
-  color: #06140d;
-  font-weight: 700;
   cursor: pointer;
+}
+.tk-buy {
+  color: var(--accent-ink);
+  text-decoration: none;
+  cursor: pointer;
+}
+.tk-buy:hover {
+  text-decoration: underline;
+}
+.tk-warn {
+  font-size: 11px;
+  color: #6f6048;
 }
 
 /* красивый скроллбар у модалок (магазин и др. скроллятся целиком) */

@@ -8,7 +8,7 @@
   --accent: #f5b32a;
   --accent-ink: #ffd27a;
 
-  font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+  font-family: "IBM Plex Mono", ui-monospace, "Cascadia Code", monospace;
   color: var(--ink);
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
