@@ -1243,6 +1243,14 @@ textarea {
   position: relative;
   z-index: 1;
 }
+.btn-daily-ready {
+  border-color: var(--accent);
+  animation: dailyPulse 1.6s ease-in-out infinite;
+}
+@keyframes dailyPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 179, 42, 0.45); }
+  50% { box-shadow: 0 0 0 6px rgba(245, 179, 42, 0); }
+}
 
 /* ---------- modal / shop ---------- */
 .scrim {

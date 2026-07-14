@@ -1583,7 +1583,7 @@ export default function App() {
                   <button className="btn btn-secondary" onClick={() => setModal("leaderboard")}>🏆 Ranks</button>
                 </div>
 
-                <button className="btn btn-daily" disabled={!dailyReady || !rewardsUnlocked} onClick={claimDaily} title={!rewardsUnlocked ? "Connect & verify your wallet to claim daily rewards" : undefined}>
+                <button className={"btn btn-daily" + (dailyReady && rewardsUnlocked ? " btn-daily-ready" : "")} disabled={!dailyReady || !rewardsUnlocked} onClick={claimDaily} title={!rewardsUnlocked ? "Connect & verify your wallet to claim daily rewards" : undefined}>
                   {rewardsUnlocked && !dailyReady && (
                     <span className="btn-daily-fill" style={{ width: `${dailyProgressPct()}%` }} />
                   )}
