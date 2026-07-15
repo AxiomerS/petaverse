@@ -1553,8 +1553,9 @@ export default function App() {
                     const mm = Math.floor(left / 60000);
                     const ss = Math.floor((left % 60000) / 1000);
                     const pct = Math.max(0, Math.min(100, (left / m.durationMs) * 100));
+                    const expiringSoon = left <= 10000;
                     return (
-                      <span key={b.kind} className="buff-chip" title={`${m.label}`}>
+                      <span key={b.kind} className={"buff-chip" + (expiringSoon ? " buff-chip-warn" : "")} title={`${m.label}`}>
                         <span className="buff-ring" style={{ background: `conic-gradient(var(--accent) ${pct}%, rgba(255,255,255,0.18) 0)` }}>
                           <span className="buff-ring-inner">{m.emoji}</span>
                         </span>

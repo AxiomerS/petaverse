@@ -266,6 +266,13 @@ textarea {
   font-size: 8px;
   line-height: 1;
 }
+.buff-chip-warn {
+  animation: buffWarnFlash 1s ease-in-out infinite;
+}
+@keyframes buffWarnFlash {
+  0%, 100% { border-color: var(--accent); color: var(--accent-ink); }
+  50% { border-color: #ff7a8a; color: #ff7a8a; }
+}
 .buffs-wrap {
   position: relative;
   display: flex;
