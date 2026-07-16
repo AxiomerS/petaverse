@@ -1531,7 +1531,7 @@ export default function App() {
                 <div className="stats">
                   <StatBar label="Fullness" value={pet.stats.fullness} max={cap} color="#ffb020" />
                   <StatBar label="Happiness" value={pet.stats.happiness} max={cap} color="#ff7ac8" />
-                  <StatBar label="Health" value={pet.stats.health} color="#1ad17a" />
+                  <StatBar label="Health" value={pet.stats.health} color="#1ad17a" warnLow />
                   {/* XP / level */}
                   <div className="stat">
                     <div className="stat-head">

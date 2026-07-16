@@ -226,6 +226,13 @@ textarea {
   /* глянцевый блик сверху + лёгкая тень снизу */
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -4px 6px rgba(0, 0, 0, 0.18);
 }
+.stat-fill-low {
+  animation: statLowPulse 1s ease-in-out infinite;
+}
+@keyframes statLowPulse {
+  0%, 100% { background: #1ad17a; }
+  50% { background: #ff7a8a; }
+}
 
 /* ---------- buffs ---------- */
 .buffs {

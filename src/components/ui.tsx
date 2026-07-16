@@ -5,8 +5,9 @@ export function Coin() {
   return <span className="sil-coin">PV</span>;
 }
 
-export function StatBar({ label, value, color, max = 100 }: { label: string; value: number; color: string; max?: number }) {
+export function StatBar({ label, value, color, max = 100, warnLow = false }: { label: string; value: number; color: string; max?: number; warnLow?: boolean }) {
   const pct = Math.max(0, Math.min(100, (value / max) * 100));
+  const low = warnLow && pct <= 20;
   return (
     <div className="stat">
       <div className="stat-head">
@@ -14,7 +15,7 @@ export function StatBar({ label, value, color, max = 100 }: { label: string; val
         <span className="stat-val">{Math.round(value)}{max !== 100 ? ` / ${max}` : ""}</span>
       </div>
       <div className="stat-track">
-        <div className="stat-fill" style={{ width: `${pct}%`, background: color }} />
+        <div className={"stat-fill" + (low ? " stat-fill-low" : "")} style={{ width: `${pct}%`, background: color }} />
       </div>
     </div>
   );
