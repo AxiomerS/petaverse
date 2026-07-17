@@ -1502,7 +1502,7 @@ export default function App() {
               </div>
             ) : (
               <>
-                <div className="pet-stage">
+                <div className="pet-stage" key={pet.species}>
                   <span className="pet-glow" style={{ background: RARITY[PETS.find((p) => p.id === pet.species)?.rarity ?? "common"].color }} />
                   <button className="pet-emoji-big pet-emoji-btn" onClick={() => setPetMenu(true)} title={`Interact with ${pet.name}`}>
                     <PetArt species={pet.species} size={110} />
