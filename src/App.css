@@ -666,6 +666,10 @@ textarea {
   color: var(--ink-2);
   cursor: pointer;
 }
+.tk-ca-copied {
+  color: #1ad17a;
+  font-weight: 700;
+}
 .tk-buy {
   color: var(--accent-ink);
   text-decoration: none;

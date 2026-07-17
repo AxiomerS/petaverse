@@ -138,6 +138,7 @@ export default function App() {
   const [exPrice, setExPrice] = useState<string>(""); // админ-форма: цена SOL
   const [exStock, setExStock] = useState<string>("1"); // админ-форма: тираж
   const [toast, setToast] = useState("");
+  const [caCopied, setCaCopied] = useState(false); // временная галочка на месте CA после копирования
   // Chest opening: a roulette strip of emojis that scrolls and lands on the won one.
   // Display-only — the won item is already added to inventory/owned when the chest opens.
   type WonItem = { emoji: string; label: string; rarity: Rarity; rarityLabel?: string; rarityColor?: string };
@@ -2240,8 +2241,17 @@ export default function App() {
               <span className="tk-tick">$PV · {TOKEN_CA ? "live" : "not launched"}</span>
               {TOKEN_CA ? (
                 <>
-                  <span className="tk-ca" title={TOKEN_CA} onClick={() => { navigator.clipboard?.writeText(TOKEN_CA); setToast("CA copied"); }}>
-                    {TOKEN_CA.slice(0, 6)}…{TOKEN_CA.slice(-4)}
+                  <span
+                    className={"tk-ca" + (caCopied ? " tk-ca-copied" : "")}
+                    title={TOKEN_CA}
+                    onClick={() => {
+                      navigator.clipboard?.writeText(TOKEN_CA);
+                      setToast("CA copied");
+                      setCaCopied(true);
+                      setTimeout(() => setCaCopied(false), 1000);
+                    }}
+                  >
+                    {caCopied ? "✓ copied" : `${TOKEN_CA.slice(0, 6)}…${TOKEN_CA.slice(-4)}`}
                   </span>
                   <a className="tk-buy" href={LINK_PUMPFUN} target="_blank" rel="noreferrer">buy on pump.fun ▸</a>
                   <span className="tk-warn">only trust this address</span>
