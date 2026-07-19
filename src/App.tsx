@@ -432,6 +432,7 @@ export default function App() {
       listings: [],
       progress: {},
       lastDaily: 0,
+      dailyStreak: 0,
       totalScore: 0,
       bestScore: 0,
       lastRunReward: 0,
@@ -1061,7 +1062,11 @@ export default function App() {
     if (!rewardsUnlocked) return setToast("Connect & verify your wallet to claim daily rewards");
     const res = await pvDaily();
     if ("error" in res) { if (typeof res.coins === "number") setCoins(res.coins); return setToast("Daily not ready yet"); }
-    setPet((p) => (p ? { ...p, coins: res.coins, lastDaily: Date.now(), updatedAt: Date.now() } : p));
+    // Стрик держится, пока не пропущено больше одного полного окна между claim'ами (чисто визуальный счётчик).
+    const now = Date.now();
+    const kept = pet.lastDaily > 0 && now - pet.lastDaily <= DAILY_COOLDOWN * 2;
+    const dailyStreak = kept ? pet.dailyStreak + 1 : 1;
+    setPet((p) => (p ? { ...p, coins: res.coins, lastDaily: now, dailyStreak, updatedAt: now } : p));
     setToast(`Daily reward: +${res.credited} ${SIL}`);
   }
 
@@ -1591,6 +1596,7 @@ export default function App() {
                   )}
                   <span className="btn-daily-label">
                     {!rewardsUnlocked ? "🎁 Connect wallet for daily" : dailyReady ? `🎁 Claim daily +${DAILY_REWARD} ${SIL}` : `🎁 Daily in ${dailyLeft()}`}
+                    {rewardsUnlocked && pet.dailyStreak >= 2 && <span className="daily-streak"> · 🔥 {pet.dailyStreak} streak</span>}
                   </span>
                 </button>
               </>

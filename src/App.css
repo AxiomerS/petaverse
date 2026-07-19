@@ -1261,6 +1261,10 @@ textarea {
   position: relative;
   z-index: 1;
 }
+.daily-streak {
+  color: #ffb020;
+  font-weight: 700;
+}
 .btn-daily-ready {
   border-color: var(--accent);
   animation: dailyPulse 1.6s ease-in-out infinite;

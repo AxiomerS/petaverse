@@ -43,6 +43,7 @@ export type SavedPet = {
   // каждого неактивного пета аксессуары (остаются на нём при переключении, уходят при продаже).
   progress: Record<string, { stats: Stats; xp: number; level: number; buffs: { kind: BuffKind; expiresAt: number }[]; accessories?: string[] }>;
   lastDaily: number;
+  dailyStreak: number; // подряд забранных daily-наград без пропуска окна — чисто визуальный счётчик
   totalScore: number; // суммарные очки за все игры Play (накопительно, для показа в углу)
   bestScore: number; // лучший счёт за один заход (для лидерборда)
   lastRunReward: number; // когда в последний раз забирали почасовую награду за топ-забег
@@ -99,6 +100,7 @@ export function loadPet(): SavedPet | null {
       listings: p.listings ?? [],
       progress: decayInactive(p.progress ?? {}, p.updatedAt, now), // неактивные питомцы распадаются в 10× медленнее
       lastDaily: p.lastDaily ?? 0,
+      dailyStreak: p.dailyStreak ?? 0,
       totalScore: p.totalScore ?? 0,
       bestScore: p.bestScore ?? 0,
       lastRunReward: p.lastRunReward ?? 0,
@@ -137,6 +139,7 @@ export function hydrateSave(p: any): SavedPet {
     listings: p.listings ?? [],
     progress: p.progress ?? {},
     lastDaily: p.lastDaily ?? 0,
+    dailyStreak: p.dailyStreak ?? 0,
     totalScore: p.totalScore ?? 0,
     bestScore: p.bestScore ?? 0,
     lastRunReward: p.lastRunReward ?? 0,
